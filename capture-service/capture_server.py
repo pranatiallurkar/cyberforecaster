@@ -1,0 +1,3575 @@
+"""
+CyberForecaster Capture Server
+Real-time network packet capture via Scapy + Npcap, streamed to React frontend over WebSocket.
+"""
+
+import asyncio
+import os
+import json
+import sys
+import time
+import threading
+import ipaddress
+import socket
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+
+def _is_multicast_or_broadcast(ip_str: str) -> bool:
+    """Check if an IP address is multicast or subnet broadcast."""
+    if not ip_str:
+        return False
+    try:
+        if ip_str == "255.255.255.255" or ip_str.endswith(".255"):
+            return True
+        ip = ipaddress.ip_address(ip_str)
+        return ip.is_multicast or ip.is_reserved or ip.is_loopback
+    except ValueError:
+        return False
+
+import subprocess
+import psutil
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+from scapy.all import sniff, get_if_list, get_if_addr, conf
+from scapy.layers.inet import IP, TCP, UDP, ICMP
+try:
+    from scapy.layers.inet6 import IPv6
+except Exception:
+    IPv6 = None
+import csv
+import hashlib
+
+# Import centralized taxonomy
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+try:
+    from models.taxonomy import (
+        LABEL_BENIGN, LABEL_PORT_SCAN, LABEL_BRUTE_FORCE, LABEL_DOS_DDOS,
+        LABEL_EXFILTRATION, LABEL_UNKNOWN, DISPLAY_NAMES, AUTH_PORTS,
+        WELL_KNOWN_PORTS, normalize_label, to_display_name, is_auth_port
+    )
+except Exception as _e:
+    AUTH_PORTS = {21, 22, 23, 110, 1433, 2222, 3306, 3389, 5432, 5900, 6379, 27017}
+    WELL_KNOWN_PORTS = {53, 80, 123, 137, 138, 139, 443, 445, 1900, 3000, 5000, 5173, 5353, 5355, 8000, 8080, 8443, 8545, 9090}
+    def normalize_label(l): return str(l).lower()
+    def to_display_name(l): return str(l).title()
+    def is_auth_port(p): return p in AUTH_PORTS
+
+# Live data collection for retraining
+_LIVE_DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'logs')
+_LIVE_FLOWS_CSV = os.path.join(_LIVE_DATA_DIR, 'live_flows_for_training.csv')
+_live_flow_writer = None
+_live_flow_file = None
+_LIVE_FLOW_LOCK = threading.Lock()
+_LIVE_FLOW_COUNT = 0
+_MAX_LIVE_FLOWS = 100000  # Rotate after 100k flows
+
+def _init_live_flow_writer():
+    """Initialize CSV writer for live flow data collection."""
+    global _live_flow_writer, _live_flow_file
+    try:
+        os.makedirs(_LIVE_DATA_DIR, exist_ok=True)
+        write_header = not os.path.exists(_LIVE_FLOWS_CSV)
+        _live_flow_file = open(_LIVE_FLOWS_CSV, 'a', newline='')
+        _live_flow_writer = csv.writer(_live_flow_file)
+        if write_header:
+            _live_flow_writer.writerow([
+                'src_ip', 'src_port', 'dst_ip', 'dst_port', 'protocol',
+                'packet_count', 'byte_count', 'duration', 'syn_flag',
+                'ack_flag', 'rst_flag', 'fin_flag', 'label'
+            ])
+            _live_flow_file.flush()
+        print(f'[Live] Flow data collection initialized: {_LIVE_FLOWS_CSV}')
+    except Exception as e:
+        print(f'[Live] Could not init flow writer: {e}')
+        _live_flow_writer = None
+
+def _log_live_flow(flow_data: dict):
+    """Log a completed flow to CSV for future model retraining."""
+    global _live_flow_file, _live_flow_writer, _LIVE_FLOW_COUNT
+    if not _live_flow_writer:
+        return
+    try:
+        with _LIVE_FLOW_LOCK:
+            _LIVE_FLOW_COUNT += 1
+            if _LIVE_FLOW_COUNT > _MAX_LIVE_FLOWS:
+                # Rotate file
+                if _live_flow_file:
+                    _live_flow_file.close()
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                rotated = os.path.join(_LIVE_DATA_DIR, f'live_flows_{ts}.csv')
+                os.rename(_LIVE_FLOWS_CSV, rotated)
+                _init_live_flow_writer()
+
+            # Determine label from current severity
+            sev = flow_data.get('severity', 'none')
+            atk = flow_data.get('attack_type', 'Benign')
+            label = 'benign'
+            if sev != 'none':
+                label_map = {
+                    'Port Scan': 'port_scan', 'DDoS': 'dos_ddos',
+                    'SYN Flood': 'dos_ddos', 'Brute Force': 'brute_force',
+                    'ICMP Flood': 'dos_ddos', 'Data Exfiltration': 'exfiltration',
+                    'Large Transfer': 'benign',  # Not necessarily malicious
+                    'Reset Storm': 'benign',
+                }
+                label = label_map.get(atk, 'benign')
+
+            _live_flow_writer.writerow([
+                flow_data.get('src_ip', ''),
+                flow_data.get('src_port', 0),
+                flow_data.get('dst_ip', ''),
+                flow_data.get('dst_port', 0),
+                flow_data.get('protocol', 'TCP'),
+                flow_data.get('packet_count', 1),
+                flow_data.get('byte_count', 0),
+                round(flow_data.get('duration', 0.001), 6),
+                flow_data.get('syn_flag', 0),
+                flow_data.get('ack_flag', 0),
+                flow_data.get('rst_flag', 0),
+                flow_data.get('fin_flag', 0),
+                label,
+            ])
+            if _LIVE_FLOW_COUNT % 500 == 0:
+                _live_flow_file.flush()
+    except Exception:
+        pass
+
+# ── Persistent Audit Trail Integration (MongoDB & Blockchain) ──────────────
+_CURRENT_CAPTURE_SESSION_ID = f"session-{int(time.time())}"
+_AUDIT_LOG_THROTTLE = {}
+
+def _post_audit_event_async(event_dict: dict):
+    """No-op stub (MongoDB & Blockchain audit trail decoupled)."""
+    pass
+
+# ── Live aggregation note ──────────────────────────────────────────────────
+# Stage forecasts are computed per REAL communication pair (src_ip, dst_ip)
+# from finalized 5-second windows in LIVE_WINDOW_HISTORY — never per demo host.
+
+# ML inference (lazy-loaded on first use)
+_ml_predict_flow = None
+_ml_loaded = False
+
+def _lazy_load_ml():
+    global _ml_predict_flow, _ml_loaded
+    if _ml_loaded:
+        return
+    _ml_loaded = True
+    try:
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from models.flow_classifier_infer import predict_flow
+        _ml_predict_flow = predict_flow
+        print('[ML] Flow classifier loaded successfully.')
+    except Exception as e:
+        print(f'[ML] Could not load flow classifier: {e}')
+        print('[ML] Continuing without ML predictions.')
+
+# ── Privilege check (Windows) ─────────────────────────────────────────────────
+def _check_admin():
+    if sys.platform == "win32":
+        import ctypes
+        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        if not is_admin:
+            print("\n" + "=" * 60)
+            print("  WARNING: Not running as Administrator!")
+            print("  Scapy requires elevated privileges on Windows")
+            print("  for raw packet capture via Npcap.")
+            print()
+            print("  Fix: Run start.ps1 or this terminal as Admin,")
+            print("       OR right-click -> 'Run as administrator'.")
+            print("=" * 60 + "\n")
+        else:
+            print("[+] Running as Administrator - Scapy capture enabled.")
+
+app = FastAPI(title="CyberForecaster Capture Server")
+
+@app.on_event("startup")
+async def _on_startup():
+    """Build Scapy device map, capture running event loop, start the live forecast loop, sync live firewall rules."""
+    global _main_loop
+    _main_loop = asyncio.get_event_loop()
+    _build_scapy_map()
+    _init_live_flow_writer()
+    _sync_live_block_state()
+    print(f"[Startup] Scapy device map built: {len(iface_to_scapy)} Npcap devices found. Live firewall block state synchronized.")
+    _ensure_stage_forecast_loop()
+
+
+@app.on_event("shutdown")
+async def _on_shutdown():
+    """Stop all capture threads and kill WSL processes on server shutdown."""
+    print("[Shutdown] Stopping all packet capture processes...")
+    stop_all_captures_except(None)
+    reset_backend_state()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+active_captures: dict[str, bool] = {}           # iface -> is_capturing
+capture_threads: dict[str, threading.Thread] = {}
+wsl_processes: dict[str, subprocess.Popen] = {}
+connected_clients: list[WebSocket] = []
+flow_cache: dict[str, dict] = {}                 # 5-tuple -> aggregated flow
+flow_lock = threading.Lock()
+_raw_packet_buffer: list = []
+_raw_packet_lock = threading.Lock()
+capture_stats = {
+    "total_packets": 0,
+    "start_time": None,
+}
+
+# Well-known service ports that should NEVER trigger attack classification.
+# DNS, NTP, mDNS, LLMNR, SSDP, and standard web/service ports are normal traffic.
+WELL_KNOWN_UDP_SERVICES = {53, 123, 5353, 5355, 1900, 137, 138, 139, 445, 5060}
+WELL_KNOWN_TCP_PORTS = {80, 443, 8080, 8443, 3000, 5000, 5173, 8000, 8545, 27017, 6379, 9090, 5432, 3306, 1433}
+SERVER_RESPONSE_PORTS = WELL_KNOWN_UDP_SERVICES | WELL_KNOWN_TCP_PORTS | WELL_KNOWN_PORTS | AUTH_PORTS
+
+# Per-IP tracking for flow-level heuristic detection
+_ip_flows: dict[str, list] = {}          # src_ip -> list of recent flow timestamps
+_ip_ports: dict[str, set] = {}            # src_ip -> set of unique dst_ports hit
+_ip_bytes: dict[str, int] = {}            # src_ip -> total bytes sent recently
+_ip_dst: dict[str, dict] = {}            # src_ip -> {dst_ip: flow_count}
+_ip_dst_ports: dict[str, dict] = defaultdict(lambda: defaultdict(set)) # src_ip -> dst_ip -> set of dports
+_ip_port_attempts: dict[str, dict] = defaultdict(lambda: defaultdict(lambda: defaultdict(list))) # src_ip -> dst_ip -> dport -> timestamps
+_TRACKING_WINDOW = 8  # seconds for tracking window
+
+# Bounded per-host risk history for data-driven forecast trend projection
+_host_risk_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=12))
+
+# ── Real live host registry ──────────────────────────────────────────────
+# Every IP actually observed on the wire is registered here dynamically.
+# This is intentionally SEPARATE from any seeded/demo host list: live IPs are
+# never replaced by demo IPs (192.168.1.10/.15/.20/.45/.50 are demo-only).
+LIVE_HOSTS_DB: dict[str, dict] = {}
+
+# Per-communication-pair temporal history for the stage forecaster.
+# Keyed by the REAL observed pair (src_ip, dst_ip); each value is the
+# chronological list of finalized 5-second live windows (max 10 kept).
+LIVE_WINDOW_HISTORY: dict[tuple, list] = {}
+
+# Active 5-second window accumulators per pair for fixed time boundary closing
+_pair_window_buckets: dict[tuple, dict] = {}
+_flow_last_seq: dict = {}  # 5-tuple key -> last TCP seq seen (retransmit detection)
+
+# Number of consecutive finalized 5-second windows required before LSTM inference
+MIN_LIVE_WINDOWS = 10
+# Duration of one live aggregation window in seconds
+LIVE_WINDOW_SECONDS = 5.0
+# Minimum attack probability (effective risk) before a live forecast becomes an alert
+LIVE_ALERT_THRESHOLD = 0.5
+
+def _register_live_host(ip: str, role: str = None, threat_level: str = "none",
+                        predicted_stage: str = "normal") -> None:
+    """Dynamically register a REAL observed IP in LIVE_HOSTS_DB (no demo substitution)."""
+    if not ip or ip == "unknown":
+        return
+    now = datetime.utcnow().isoformat()
+    host = LIVE_HOSTS_DB.get(ip)
+    if host is None:
+        LIVE_HOSTS_DB[ip] = {
+            "ip": ip,
+            "firstSeen": now,
+            "lastSeen": now,
+            "role": role,
+            "threatLevel": threat_level,
+            "predictedStage": predicted_stage,
+            "source": "live_capture",
+        }
+        print(f"[LIVE_HOST] Registered real live host: {ip} (role={role or 'unknown'})")
+    else:
+        host["lastSeen"] = now
+        if role:
+            host["role"] = role
+        if threat_level and threat_level != "none":
+            host["threatLevel"] = threat_level
+        if predicted_stage and predicted_stage != "normal":
+            host["predictedStage"] = predicted_stage
+
+
+def _live_pair_key(src_ip: str, dst_ip: str) -> tuple:
+    """Return the canonical (src_ip, dst_ip) identity key for temporal history."""
+    return (src_ip, dst_ip)
+
+
+def _append_live_window(src_ip: str, dst_ip: str, window: dict) -> list:
+    """Append a finalized window to the REAL pair's history, capped at MIN_LIVE_WINDOWS."""
+    history = LIVE_WINDOW_HISTORY.setdefault(_live_pair_key(src_ip, dst_ip), [])
+    history.append(window)
+    if len(history) > MIN_LIVE_WINDOWS:
+        del history[: len(history) - MIN_LIVE_WINDOWS]
+    return history
+
+# Mapping from friendly interface name -> Scapy Npcap device GUID
+iface_to_scapy: dict[str, str] = {}
+
+# Main asyncio event loop – stored at startup so background threads can
+# schedule WebSocket sends safely (asyncio.run() is forbidden in threads).
+_main_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _build_scapy_map():
+    """Build IP/device-to-Npcap mapping so we can sniff using friendly names."""
+    global iface_to_scapy
+    try:
+        iface_dict = getattr(conf, "ifaces", {})
+        for dev, obj in iface_dict.items():
+            try:
+                ip = getattr(obj, "ip", "")
+                name = getattr(obj, "name", "")
+                if dev:
+                    iface_to_scapy[dev] = ip
+                if name:
+                    iface_to_scapy[name] = ip
+            except Exception:
+                pass
+        for dev in get_if_list():
+            try:
+                ip = get_if_addr(dev)
+                iface_to_scapy[dev] = ip
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _resolve_scapy_iface(friendly_name: str) -> str:
+    """Resolve a psutil friendly name to its Scapy Npcap device GUID or adapter."""
+    # 1. Match from conf.ifaces items
+    try:
+        for dev, iface_obj in getattr(conf, "ifaces", {}).items():
+            name = getattr(iface_obj, "name", "")
+            desc = getattr(iface_obj, "description", "")
+            netname = getattr(iface_obj, "network_name", "")
+            guid = getattr(iface_obj, "guid", "")
+            ip = getattr(iface_obj, "ip", "")
+            if friendly_name.lower() in (name.lower(), desc.lower(), str(dev).lower(), str(guid).lower(), netname.lower()):
+                return dev
+            if ip and ip == friendly_name:
+                return dev
+    except Exception:
+        pass
+
+    # 2. Match from iface_to_scapy
+    for dev, ip in iface_to_scapy.items():
+        if dev.lower() == friendly_name.lower():
+            return dev
+
+    # 3. Match by IP address via psutil
+    try:
+        psutil_addrs = psutil.net_if_addrs()
+        target_ip = None
+        for name, addr_list in psutil_addrs.items():
+            if name.lower() == friendly_name.lower():
+                for a in addr_list:
+                    if getattr(a.family, "name", "") == "AF_INET":
+                        target_ip = a.address
+                        break
+                break
+
+        if target_ip:
+            for dev, iface_obj in getattr(conf, "ifaces", {}).items():
+                if getattr(iface_obj, "ip", "") == target_ip:
+                    return dev
+            for dev, ip in iface_to_scapy.items():
+                if ip == target_ip:
+                    return dev
+    except Exception:
+        pass
+
+    # Fallback: return the name as-is
+    return friendly_name
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_cached_wsl_interfaces: list[dict] | None = None
+_cached_wsl_time: float = 0.0
+_wsl_probe_in_progress: bool = False
+
+def _probe_wsl_sync():
+    global _cached_wsl_interfaces, _cached_wsl_time, _wsl_probe_in_progress
+    now = time.time()
+    if sys.platform != "win32":
+        _cached_wsl_interfaces = []
+        _cached_wsl_time = now
+        _wsl_probe_in_progress = False
+        return
+
+    try:
+        res_route = subprocess.run(
+            ["wsl.exe", "ip", "-4", "route", "show", "default"],
+            capture_output=True, text=True, timeout=2
+        )
+        if res_route.returncode == 0 and res_route.stdout:
+            parts = res_route.stdout.strip().split()
+            if "dev" in parts:
+                idx = parts.index("dev")
+                wsl_iface = parts[idx + 1]
+                res_ip = subprocess.run(
+                    ["wsl.exe", "ip", "-4", "addr", "show", wsl_iface],
+                    capture_output=True, text=True, timeout=2
+                )
+                wsl_ip = "172.31.195.203"
+                for line in res_ip.stdout.splitlines():
+                    line = line.strip()
+                    if line.startswith("inet "):
+                        wsl_ip = line.split()[1].split("/")[0]
+                        break
+                name = f"WSL ({wsl_iface})"
+                _cached_wsl_interfaces = [{
+                    "name": name,
+                    "display_name": name,
+                    "ip": wsl_ip,
+                    "mac": "N/A",
+                    "type": "Virtual",
+                    "is_up": True,
+                    "bytes_sent": 0,
+                    "bytes_recv": 0,
+                    "is_wsl": True,
+                    "wsl_iface": wsl_iface,
+                }]
+                _cached_wsl_time = now
+                _wsl_probe_in_progress = False
+                return
+    except Exception:
+        pass
+
+    _cached_wsl_interfaces = []
+    _cached_wsl_time = now
+    _wsl_probe_in_progress = False
+
+
+def _get_wsl_interfaces() -> list[dict]:
+    """Detect active WSL interface and IP address non-blockingly."""
+    global _cached_wsl_interfaces, _cached_wsl_time, _wsl_probe_in_progress
+    now = time.time()
+    if _cached_wsl_interfaces is not None and (now - _cached_wsl_time) < 60.0:
+        return _cached_wsl_interfaces
+
+    if not _wsl_probe_in_progress:
+        _wsl_probe_in_progress = True
+        threading.Thread(target=_probe_wsl_sync, daemon=True).start()
+
+    return _cached_wsl_interfaces if _cached_wsl_interfaces is not None else []
+
+
+_cached_interfaces: list[dict] | None = None
+_cached_interfaces_time: float = 0.0
+
+def get_real_interfaces() -> list[dict]:
+    """Detect real network interfaces using psutil + scapy + WSL auto-discovery (cached for 3s)."""
+    global _cached_interfaces, _cached_interfaces_time
+    now = time.time()
+    if _cached_interfaces is not None and (now - _cached_interfaces_time) < 3.0:
+        return _cached_interfaces
+
+    interfaces = []
+    wsl_ifaces = _get_wsl_interfaces()
+    for w_if in wsl_ifaces:
+        interfaces.append(w_if)
+
+    addrs = psutil.net_if_addrs()
+    stats = psutil.net_if_stats()
+    io_counters = psutil.net_io_counters(pernic=True)
+
+    for name, addr_list in addrs.items():
+        ip_addr = None
+        mac_addr = None
+        for a in addr_list:
+            if a.family.name == "AF_INET":
+                ip_addr = a.address
+            elif a.family.name == "AF_LINK":
+                mac_addr = a.address
+
+        is_up = stats.get(name, None)
+        is_connected = is_up.isup if is_up else False
+
+        io = io_counters.get(name, None)
+        bytes_sent = io.bytes_sent if io else 0
+        bytes_recv = io.bytes_recv if io else 0
+
+        # Determine interface type heuristic
+        iface_type = "Unknown"
+        nl = name.lower()
+        if "wi-fi" in nl or "wifi" in nl or "wlan" in nl or "wireless" in nl:
+            iface_type = "WiFi"
+        elif "ethernet" in nl or "eth" in nl or "local area" in nl:
+            iface_type = "Ethernet"
+        elif "bluetooth" in nl or "bt" in nl:
+            iface_type = "Bluetooth"
+        elif "vpn" in nl or "tunnel" in nl or "wg" in nl:
+            iface_type = "VPN"
+        elif "vmware" in nl or "virtual" in nl or "veth" in nl:
+            iface_type = "Virtual"
+        elif "loopback" in nl:
+            iface_type = "Loopback"
+        elif "docker" in nl or "br-" in nl:
+            iface_type = "Docker"
+
+        interfaces.append({
+            "name": name,
+            "display_name": name,
+            "ip": ip_addr or "N/A",
+            "mac": mac_addr or "N/A",
+            "type": iface_type,
+            "is_up": is_connected,
+            "bytes_sent": bytes_sent,
+            "bytes_recv": bytes_recv,
+        })
+
+    # Sort: connected first, then by type priority
+    priority = {"WiFi": 0, "Ethernet": 1, "VPN": 2, "Bluetooth": 3, "Virtual": 4, "Unknown": 5}
+    interfaces.sort(key=lambda x: (not x.get("is_up", False), priority.get(x.get("type", "Unknown"), 99)))
+    _cached_interfaces = interfaces
+    _cached_interfaces_time = now
+    return interfaces
+
+
+def _build_flow_key(pkt) -> str | None:
+    """Build a 5-tuple key from a packet."""
+    if not pkt.haslayer(IP):
+        return None
+    src = pkt[IP].src
+    dst = pkt[IP].dst
+    proto = pkt[IP].proto
+    sport = 0
+    dport = 0
+    if pkt.haslayer(TCP):
+        sport = pkt[TCP].sport
+        dport = pkt[TCP].dport
+    elif pkt.haslayer(UDP):
+        sport = pkt[UDP].sport
+        dport = pkt[UDP].dport
+    return f"{src}:{sport}-{dst}:{dport}-{proto}"
+
+
+def _packet_to_flow_event(pkt) -> dict | None:
+    """Convert a scapy packet into a flow event dict for the frontend."""
+    src_ip = None
+    dst_ip = None
+    ttl = 64
+
+    if pkt.haslayer(IP):
+        ip = pkt[IP]
+        src_ip = ip.src
+        dst_ip = ip.dst
+        ttl = getattr(ip, "ttl", 64)
+    elif IPv6 is not None and pkt.haslayer(IPv6):
+        ip6 = pkt[IPv6]
+        src_ip = ip6.src
+        dst_ip = ip6.dst
+        ttl = getattr(ip6, "hlim", 64)
+    else:
+        return None
+
+    proto_name = "Other"
+    sport = 0
+    dport = 0
+    syn = ack = rst = fin = 0
+
+    win_size = 0
+    seq_num = None
+    payload_len = 0
+
+    if pkt.haslayer(TCP):
+        proto_name = "TCP"
+        sport = pkt[TCP].sport
+        dport = pkt[TCP].dport
+        flags = pkt[TCP].flags
+        syn = 1 if flags.S else 0
+        ack = 1 if flags.A else 0
+        rst = 1 if flags.R else 0
+        fin = 1 if flags.F else 0
+        try:
+            win_size = int(getattr(pkt[TCP], "window", 0) or 0)
+            seq_num = int(getattr(pkt[TCP], "seq", 0) or 0)
+            payload_len = len(bytes(pkt[TCP].payload)) if pkt[TCP].payload else 0
+        except Exception:
+            pass
+    elif pkt.haslayer(UDP):
+        proto_name = "UDP"
+        sport = pkt[UDP].sport
+        dport = pkt[UDP].dport
+        try:
+            payload_len = len(bytes(pkt[UDP].payload)) if pkt[UDP].payload else 0
+        except Exception:
+            pass
+    elif pkt.haslayer(ICMP):
+        proto_name = "ICMP"
+
+    frag_flag = 0
+    if pkt.haslayer(IP):
+        try:
+            ip_flags = pkt[IP].flags
+            frag_offset = getattr(pkt[IP], "frag", 0)
+            if (hasattr(ip_flags, "MF") and ip_flags.MF) or (frag_offset and frag_offset > 0):
+                frag_flag = 1
+        except Exception:
+            pass
+
+    pkt_len = len(pkt)
+    now = datetime.utcnow().isoformat()
+    pkt_time = float(getattr(pkt, "time", time.time()))
+
+    raw_hex = None
+    try:
+        raw_hex = bytes(pkt).hex()
+    except Exception:
+        pass
+
+    # Default all single packets to Benign (none severity)
+    severity = "none"
+    attack_type = "Benign"
+
+    return {
+        "id": f"{now}-{src_ip}-{dst_ip}-{sport}-{dport}",
+        "timestamp": now,
+        "src_ip": src_ip,
+        "dst_ip": dst_ip,
+        "src_port": sport,
+        "dst_port": dport,
+        "protocol": proto_name,
+        "length": pkt_len,
+        "syn": syn,
+        "ack": ack,
+        "rst": rst,
+        "fin": fin,
+        "ttl": ttl,
+        "win_size": win_size,
+        "frag_flag": frag_flag,
+        "payload_len": payload_len,
+        "seq": seq_num,
+        "severity": severity,
+        "attack_type": attack_type,
+        "raw_hex": raw_hex,
+        "pkt_time": pkt_time,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Flow-level heuristic classification
+# ---------------------------------------------------------------------------
+
+def _heuristic_classify(flow_key: str, event: dict):
+    """Reclassify a flow using aggregate flow-level heuristics with windowed context.
+    Distinguishes Port Scan from Brute Force based on port diversity vs. single-port attempt count.
+    """
+    now = time.time()
+    src_ip = event.get("src_ip", "")
+    dst_ip = event.get("dst_ip", "")
+    sport = event.get("src_port", 0)
+    dport = event.get("dst_port", 0)
+    proto = event.get("protocol", "TCP")
+    flow = flow_cache.get(flow_key)
+    if not flow:
+        return
+
+    # Check if packet is routine server/service/web traffic
+    is_server_response = (sport in SERVER_RESPONSE_PORTS or sport in WELL_KNOWN_PORTS or sport in WELL_KNOWN_TCP_PORTS or sport in WELL_KNOWN_UDP_SERVICES)
+    is_well_known_dst = (dport in WELL_KNOWN_PORTS or dport in WELL_KNOWN_TCP_PORTS or dport in WELL_KNOWN_UDP_SERVICES)
+    is_established_flow = (flow.get("packet_count", 1) >= 3 or flow.get("byte_count", 0) > 500 or (flow.get("ack_flag", 0) > 0 and flow.get("syn_flag", 0) > 0))
+    is_syn_ack = (event.get("syn", 0) > 0 and event.get("ack", 0) > 0) or (flow.get("syn_flag", 0) > 0 and flow.get("ack_flag", 0) > 0)
+    is_routine_service_traffic = is_server_response or is_syn_ack or is_well_known_dst
+
+    # ── Per-IP tracking ─────────────────────────────────────────────────
+    if src_ip not in _ip_flows:
+        _ip_flows[src_ip] = []
+        _ip_bytes[src_ip] = 0
+        _ip_dst[src_ip] = {}
+
+    _ip_flows[src_ip].append(now)
+    _ip_bytes[src_ip] += event.get("length", 0)
+    _ip_dst[src_ip][dst_ip] = _ip_dst[src_ip].get(dst_ip, 0) + 1
+
+    # Only track target port attempts for non-routine service traffic (true probe attempts)
+    if not is_routine_service_traffic:
+        _ip_port_attempts[src_ip][dst_ip][dport].append(now)
+
+    # Prune old entries outside the tracking window (30s)
+    cutoff = now - _TRACKING_WINDOW
+    _ip_flows[src_ip] = [t for t in _ip_flows[src_ip] if t > cutoff]
+
+    # Prune windowed port attempts and calculate active target ports for (src_ip -> dst_ip)
+    active_dports = set()
+    for p, timestamps in list(_ip_port_attempts[src_ip][dst_ip].items()):
+        valid_ts = [t for t in timestamps if t > cutoff]
+        if valid_ts:
+            _ip_port_attempts[src_ip][dst_ip][p] = valid_ts
+            active_dports.add(p)
+        else:
+            del _ip_port_attempts[src_ip][dst_ip][p]
+
+    _ip_dst_ports[src_ip][dst_ip] = active_dports
+
+    # Calculate active unique ports across all targets for src_ip
+    active_all_ports = set()
+    for target_ip, port_map in list(_ip_port_attempts[src_ip].items()):
+        for p, timestamps in list(port_map.items()):
+            valid_ts = [t for t in timestamps if t > cutoff]
+            if valid_ts:
+                active_all_ports.add(p)
+    _ip_ports[src_ip] = active_all_ports
+
+    first_seen_ts = flow.get("first_seen_ts", now)
+    flow_duration = max(now - first_seen_ts, 0.001)
+    pps = flow["packet_count"] / max(flow_duration, 1.0)
+    bpp = flow["byte_count"] / max(flow["packet_count"], 1)
+
+    recent_flows = len(_ip_flows[src_ip])
+    
+    # Exclude authentication ports from port-scan diversity count when inspecting brute-force candidates
+    same_port_attempts = len(_ip_port_attempts[src_ip][dst_ip].get(dport, []))
+    if same_port_attempts == 0 and is_auth_port(dport):
+        # Fallback to total flow count for this auth port if routine filter omitted single-pkt auth flows
+        same_port_attempts = flow.get("packet_count", 1)
+
+    probe_dports = {p for p in active_dports if not (is_auth_port(p) and same_port_attempts >= 3)}
+    unique_ports_contacted = len(probe_dports)
+    is_multicast = _is_multicast_or_broadcast(dst_ip) or _is_multicast_or_broadcast(src_ip)
+
+    syn_flag = flow.get("syn_flag", 0)
+    ack_flag = flow.get("ack_flag", 0)
+    rst_flag = flow.get("rst_flag", 0)
+
+    severity = "none"
+    attack_type = "Benign"
+    reason = "Normal traffic pattern"
+
+    if is_multicast:
+        severity = "none"
+        attack_type = "Benign"
+        reason = "Multicast/Broadcast traffic"
+    else:
+        # --- 1. SYN Flood Detection ---
+        if proto == "TCP" and syn_flag > 30 and ack_flag < 2 and pps > 10:
+            severity = "critical" if syn_flag > 50 else "high"
+            attack_type = "SYN Flood"
+            reason = f"High SYN-only packet rate (syn={syn_flag}, pps={pps:.1f})"
+
+        # --- 2. DDoS / Flood Detection ---
+        elif pps > 100 and flow["packet_count"] >= 200:
+            severity = "critical" if pps > 200 else "high"
+            attack_type = "DDoS"
+            reason = f"High volumetric packet flood (pps={pps:.1f}, count={flow['packet_count']})"
+
+        # --- 3. Port Scan Detection (Checked FIRST when high port diversity exists) ---
+        # Triggered by destination-port diversity on target host (unique_ports_contacted >= 4)
+        # When probing multiple ports, any auth port attempt is part of the Port Scan, NOT a single-target Brute Force attack.
+        elif unique_ports_contacted >= 4 and not is_established_flow and not is_syn_ack:
+            severity = "high" if unique_ports_contacted >= 15 or len(_ip_ports[src_ip]) >= 20 else "medium"
+            attack_type = "Port Scan"
+            reason = f"Destination port scanning detected ({unique_ports_contacted} target ports probed, {recent_flows} flows)"
+
+            # Precedence Resolution: Retroactively update any flows for this (src_ip, dst_ip) pair that were transiently
+            # misclassified as Brute Force during early probes of the scan (unless they have >= 8 single-port attempts).
+            for f_key, cached_flow in flow_cache.items():
+                if cached_flow.get("src_ip") == src_ip and cached_flow.get("dst_ip") == dst_ip:
+                    if cached_flow.get("attack_type") == "Brute Force":
+                        auth_p = cached_flow.get("dst_port", 0)
+                        attempts_on_p = len(_ip_port_attempts[src_ip][dst_ip].get(auth_p, []))
+                        if attempts_on_p < 8:
+                            cached_flow["attack_type"] = "Port Scan"
+                            cached_flow["severity"] = severity
+                            cached_flow["reason"] = f"Reclassified as part of Port Scan ({unique_ports_contacted} target ports probed)"
+
+        # --- 4. Brute Force Detection ---
+        # REQUIRES repeated connection attempts to the SAME authentication service port
+        # AND LOW port diversity (unique_ports_contacted <= 3) so multi-port scans are never misclassified
+        elif is_auth_port(dport) and (same_port_attempts >= 8 or (same_port_attempts >= 5 and flow.get("packet_count", 1) >= 5)) and unique_ports_contacted <= 3:
+            severity = "high" if same_port_attempts >= 20 else "medium"
+            attack_type = "Brute Force"
+            reason = f"Repeated authentication attempts against port {dport} ({same_port_attempts} attempts)"
+
+            # Precedence Resolution: Retroactively update all active flows targeting this auth port from this src_ip
+            # so they are consistently reported as Brute Force ONLY (never false Port Scan overlap).
+            for f_key, cached_flow in flow_cache.items():
+                if cached_flow.get("src_ip") == src_ip and cached_flow.get("dst_ip") == dst_ip and cached_flow.get("dst_port") == dport:
+                    cached_flow["attack_type"] = "Brute Force"
+                    cached_flow["severity"] = severity
+                    cached_flow["reason"] = reason
+
+        # --- 5. ICMP Flood ---
+        # Triggered by rapid/high volume ICMP echo/ping requests from src_ip
+        elif proto == "ICMP" and (flow["packet_count"] >= 30 and pps >= 2.0 or flow["packet_count"] >= 50):
+            severity = "high" if flow["packet_count"] >= 100 else "medium"
+            attack_type = "ICMP Flood"
+            reason = f"ICMP ping flood ({flow['packet_count']} packets, {pps:.1f} pps)"
+
+            # Precedence Resolution: Standardize all ICMP attack flows for this host pair to ICMP Flood
+            for f_key, cached_flow in flow_cache.items():
+                if cached_flow.get("src_ip") == src_ip and cached_flow.get("dst_ip") == dst_ip and cached_flow.get("protocol") == "ICMP":
+                    if cached_flow.get("severity") != "none":
+                        cached_flow["attack_type"] = "ICMP Flood"
+                        cached_flow["severity"] = severity
+
+        # --- 6. Data Exfiltration ---
+        elif proto == "TCP" and flow["byte_count"] > 10_000_000 and flow_duration > 5.0 and bpp > 1000:
+            severity = "high"
+            attack_type = "Data Exfiltration"
+            reason = f"Large data payload transfer ({flow['byte_count']} bytes)"
+
+    # Apply classification
+    flow["severity"] = severity
+    flow["attack_type"] = attack_type
+    flow["reason"] = reason
+    event["severity"] = severity
+    event["attack_type"] = attack_type
+    event["reason"] = reason
+
+
+# ---------------------------------------------------------------------------
+# Capture thread
+# ---------------------------------------------------------------------------
+
+def stop_all_captures_except(keep_iface: str = None):
+    """Stop active capture threads and WSL processes on all interfaces except the specified one."""
+    had_active = any(active_captures.values())
+    for iface in list(active_captures.keys()):
+        if keep_iface is None or iface != keep_iface:
+            active_captures[iface] = False
+            proc = wsl_processes.pop(iface, None)
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+    if keep_iface is None and had_active:
+        _post_audit_event_async({
+            "captureSessionId": _CURRENT_CAPTURE_SESSION_ID,
+            "timestamp": datetime.utcnow().isoformat(),
+            "eventType": "SYSTEM_EVENT",
+            "classification": "Capture Session Stopped",
+            "mitreStage": "NORMAL",
+            "severity": "LOW",
+            "evidence": "Live network packet capture stopped by user.",
+            "isConfirmedAttack": False,
+        })
+
+def reset_backend_state():
+    """Fully clear all accumulated flow and attack state on the backend."""
+    with flow_lock:
+        flow_cache.clear()
+        _ip_flows.clear()
+        _ip_ports.clear()
+        _ip_bytes.clear()
+        _ip_dst.clear()
+        _ip_dst_ports.clear()
+        _ip_port_attempts.clear()
+        _host_risk_history.clear()
+        LIVE_HOSTS_DB.clear()
+        LIVE_WINDOW_HISTORY.clear()
+        _pair_window_buckets.clear()
+        _latest_stage_forecasts.clear()
+    with _raw_packet_lock:
+        _raw_packet_buffer.clear()
+
+
+def _start_iface_capture(iface: str) -> bool:
+    """Ensure capture is running ONLY on the specified interface."""
+    global _CURRENT_CAPTURE_SESSION_ID
+    stop_all_captures_except(iface)
+    _ensure_stage_forecast_loop()
+    if active_captures.get(iface):
+        return True
+
+    # Assign fresh unique session ID for the new capture session
+    _CURRENT_CAPTURE_SESSION_ID = f"session-{int(time.time())}"
+
+    _post_audit_event_async({
+        "captureSessionId": _CURRENT_CAPTURE_SESSION_ID,
+        "timestamp": datetime.utcnow().isoformat(),
+        "eventType": "SYSTEM_EVENT",
+        "classification": "Capture Session Started",
+        "mitreStage": "NORMAL",
+        "severity": "LOW",
+        "evidence": f"Live packet capture initiated on interface: {iface}",
+        "isConfirmedAttack": False,
+    })
+
+    is_wsl = "wsl" in iface.lower()
+    target_fn = _wsl_capture_loop if is_wsl else _capture_loop
+
+    t = threading.Thread(target=target_fn, args=(iface,), daemon=True)
+    capture_threads[iface] = t
+    t.start()
+    return True
+
+
+def _process_flow_event(event: dict, iface: str):
+    """Process a parsed flow event through flow aggregation, heuristics, ML classification, and WebSocket broadcast."""
+    if event is None:
+        return
+
+    capture_stats["total_packets"] += 1
+    event["interface"] = iface
+
+    # Retain exact raw packet object in _raw_packet_buffer for PCAP export
+    raw_pkt = event.pop("_scapy_pkt", None)
+    if raw_pkt is None and event.get("raw_hex"):
+        try:
+            raw_bytes = bytes.fromhex(event["raw_hex"])
+            from scapy.layers.inet import IP, Ether
+            if len(raw_bytes) >= 20 and (raw_bytes[0] & 0xf0) == 0x40:
+                raw_pkt = IP(raw_bytes)
+            else:
+                raw_pkt = Ether(raw_bytes)
+            if event.get("pkt_time"):
+                raw_pkt.time = float(event["pkt_time"])
+        except Exception:
+            raw_pkt = None
+
+    # Fallback: if raw_pkt is still None, construct a genuine Scapy packet from event fields
+    if raw_pkt is None:
+        try:
+            from scapy.layers.inet import Ether, IP, TCP, UDP, ICMP
+            src_ip = event.get("src_ip", "127.0.0.1")
+            dst_ip = event.get("dst_ip", "127.0.0.1")
+            sport = int(event.get("src_port", 0))
+            dport = int(event.get("dst_port", 0))
+            proto = str(event.get("protocol", "TCP")).upper()
+
+            ip_pkt = IP(src=src_ip, dst=dst_ip)
+            if proto == "TCP":
+                flags = ""
+                if event.get("syn"): flags += "S"
+                if event.get("ack"): flags += "A"
+                if event.get("rst"): flags += "R"
+                if event.get("fin"): flags += "F"
+                transport = TCP(sport=sport, dport=dport, flags=flags or "A")
+            elif proto == "UDP":
+                transport = UDP(sport=sport, dport=dport)
+            elif proto == "ICMP":
+                transport = ICMP()
+            else:
+                transport = TCP(sport=sport, dport=dport)
+
+            raw_pkt = Ether(src="00:00:00:00:00:00", dst="ff:ff:ff:ff:ff:ff") / ip_pkt / transport
+            if event.get("pkt_time"):
+                raw_pkt.time = float(event["pkt_time"])
+            elif event.get("timestamp"):
+                try:
+                    dt = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00"))
+                    raw_pkt.time = dt.timestamp()
+                except Exception:
+                    raw_pkt.time = time.time()
+            else:
+                raw_pkt.time = time.time()
+        except Exception as _fe:
+            print(f"[Raw Packet Fallback Error] {_fe}")
+
+    if raw_pkt is not None:
+        with _raw_packet_lock:
+            _raw_packet_buffer.append(raw_pkt)
+            if len(_raw_packet_buffer) > 100000:
+                _raw_packet_buffer.pop(0)
+
+    src = event.get("src_ip", "")
+    dst = event.get("dst_ip", "")
+    sport = event.get("src_port", 0)
+    dport = event.get("dst_port", 0)
+    proto = event.get("protocol", "TCP")
+    key = f"{src}:{sport}-{dst}:{dport}-{proto}"
+
+    # Register REAL observed live hosts (single choke point for Npcap + WSL paths;
+    # never substituted with demo IPs).
+    _register_live_host(src, role="source")
+    _register_live_host(dst, role="target")
+
+    with flow_lock:
+        if src and dst:
+            pair = _live_pair_key(src, dst)
+            pair_key = f"{src}>{dst}"
+            now_ts = time.time()
+            if pair not in _pair_window_buckets:
+                _pair_window_buckets[pair] = {
+                    "window_start": now_ts,
+                    "packet_count": 0,
+                    "byte_count": 0,
+                    "syn_flag": 0,
+                    "ack_flag": 0,
+                    "rst_flag": 0,
+                    "fin_flag": 0,
+                    "dst_port": dport,
+                    "src_port": sport,
+                    "protocol": proto,
+                    "flow_count": 0,
+                    "severity": "none",
+                    "attack_type": "Benign",
+                    "last_seen_ts": now_ts,
+                    "ttl_list": [],
+                    "win_list": [],
+                    "payload_list": [],
+                    "frag_count": 0,
+                    "retransmit_count": 0,
+                }
+            if pair_key not in _latest_stage_forecasts:
+                cur_len = len(LIVE_WINDOW_HISTORY.get(pair, []))
+                _latest_stage_forecasts[pair_key] = {
+                    "host": dst,
+                    "sourceIp": src,
+                    "targetIp": dst,
+                    "hostIp": dst,
+                    "model_status": "WARMING UP" if cur_len < MIN_LIVE_WINDOWS else "READY",
+                    "windows_collected": cur_len,
+                    "min_windows_required": MIN_LIVE_WINDOWS,
+                    "input_shape": None if cur_len < MIN_LIVE_WINDOWS else (1, MIN_LIVE_WINDOWS, 14),
+                    "status": f"WARMING UP {cur_len}/{MIN_LIVE_WINDOWS}" if cur_len < MIN_LIVE_WINDOWS else "READY 10/10",
+                }
+            b = _pair_window_buckets[pair]
+            b["packet_count"] += 1
+            b["byte_count"] += event.get("length", 0)
+            
+            # Required Step 1 & 2 diagnostic prints
+            print(f"[REAL_LIVE_FLOW]\nsrc={src}\ndst={dst}\nsrc_port={sport}\ndst_port={dport}\nprotocol={proto}\npackets={b['packet_count']}\nbytes={b['byte_count']}", flush=True)
+            print(f"[LIVE_BUCKET_ADD]\nsrc={src}\ndst={dst}\ntimestamp={now_ts}\nbucket={b.get('window_start', now_ts)}\npacket_or_flow_added=true", flush=True)
+            b["syn_flag"] += event.get("syn", 0)
+            b["ack_flag"] += event.get("ack", 0)
+            b["rst_flag"] += event.get("rst", 0)
+            b["fin_flag"] += event.get("fin", 0)
+            b.setdefault("ttl_list", []).append(event.get("ttl", 64))
+            b.setdefault("win_list", []).append(event.get("win_size", 0))
+            b.setdefault("payload_list", []).append(event.get("payload_len", 0))
+            b["frag_count"] = b.get("frag_count", 0) + event.get("frag_flag", 0)
+            _seq = event.get("seq")
+            if _seq is not None:
+                _last_seq = _flow_last_seq.get(key)
+                if _last_seq is not None and _seq == _last_seq:
+                    b["retransmit_count"] = b.get("retransmit_count", 0) + 1
+                _flow_last_seq[key] = _seq
+            b["dst_port"] = dport
+            b["src_port"] = sport
+            b["protocol"] = proto
+            b["flow_count"] += 1
+            b["last_seen_ts"] = now_ts
+
+        if key in flow_cache:
+            flow_cache[key]["packet_count"] += 1
+            flow_cache[key]["byte_count"] += event.get("length", 0)
+            flow_cache[key]["last_seen"] = event["timestamp"]
+            flow_cache[key]["syn_flag"] = flow_cache[key].get("syn_flag", 0) + event.get("syn", 0)
+            flow_cache[key]["ack_flag"] = flow_cache[key].get("ack_flag", 0) + event.get("ack", 0)
+            flow_cache[key]["rst_flag"] = flow_cache[key].get("rst_flag", 0) + event.get("rst", 0)
+            flow_cache[key]["fin_flag"] = flow_cache[key].get("fin_flag", 0) + event.get("fin", 0)
+            try:
+                t1 = datetime.fromisoformat(flow_cache[key]["first_seen"])
+                t2 = datetime.fromisoformat(flow_cache[key]["last_seen"])
+                flow_cache[key]["duration"] = max((t2 - t1).total_seconds(), 0.001)
+            except Exception:
+                flow_cache[key]["duration"] = 0.001
+        else:
+            flow_cache[key] = {
+                "src_ip": src,
+                "dst_ip": dst,
+                "src_port": sport,
+                "dst_port": dport,
+                "protocol": proto,
+                "packet_count": 1,
+                "byte_count": event.get("length", 0),
+                "first_seen": event["timestamp"],
+                "first_seen_ts": time.time(),
+                "last_seen": event["timestamp"],
+                "duration": 0.001,
+                "severity": event.get("severity", "none"),
+                "attack_type": event.get("attack_type", "Benign"),
+                "interface": iface,
+                "syn_flag": event.get("syn", 0),
+                "ack_flag": event.get("ack", 0),
+                "rst_flag": event.get("rst", 0),
+                "fin_flag": event.get("fin", 0),
+            }
+
+    # Flow-level heuristic classification
+    _heuristic_classify(key, event)
+
+    # ML classification
+    if not _ml_loaded:
+        _lazy_load_ml()
+
+    is_mcast = _is_multicast_or_broadcast(dst) or _is_multicast_or_broadcast(src)
+    if is_mcast:
+        event["severity"] = "none"
+        event["attack_type"] = "Benign"
+        with flow_lock:
+            if key in flow_cache:
+                flow_cache[key]["severity"] = "none"
+                flow_cache[key]["attack_type"] = "Benign"
+    elif _ml_predict_flow:
+        try:
+            ml_label, ml_confidence = _ml_predict_flow(flow_cache[key])
+            now_ts   = time.time()
+            src_ip   = event.get("src_ip", "")
+            dst_ip   = event.get("dst_ip", "")
+            dport    = event.get("dst_port", 0)
+            flow     = flow_cache.get(key, {})
+            duration = max(now_ts - flow.get("first_seen_ts", now_ts), 0.001)
+
+            unique_ports_contacted = len(_ip_dst_ports[src_ip][dst_ip])
+            same_port_attempts = len(_ip_port_attempts[src_ip][dst_ip][dport])
+            current_severity = flow.get("severity", "none")
+            current_attack = flow.get("attack_type", "Benign")
+
+            ml_accept = False
+            reason = "ML prediction rejected"
+
+            norm_ml_label = normalize_label(ml_label)
+
+            if norm_ml_label == LABEL_PORT_SCAN:
+                # ML Port Scan requires genuine destination port diversity (>= 4 ports)
+                if unique_ports_contacted >= 4 and not is_auth_port(dport):
+                    ml_accept = True
+                    reason = f"ML Port Scan accepted (unique_ports={unique_ports_contacted}, conf={ml_confidence:.2f})"
+                else:
+                    reason = f"ML Port Scan rejected: Low port diversity ({unique_ports_contacted} ports < 4)"
+
+            elif norm_ml_label == LABEL_BRUTE_FORCE:
+                # Accept ML Brute Force ONLY if auth port AND low port diversity (<= 3 ports)
+                if is_auth_port(dport) and (same_port_attempts >= 3 or ml_confidence >= 0.75) and unique_ports_contacted <= 3:
+                    ml_accept = True
+                    reason = f"ML Brute Force accepted ({same_port_attempts} attempts to auth port {dport}, conf={ml_confidence:.2f})"
+                elif unique_ports_contacted >= 4:
+                    # OVERRIDE ML false Brute Force to Port Scan when port diversity is high!
+                    event["ml_label"] = "port_scan"
+                    event["ml_confidence"] = round(ml_confidence, 4)
+                    event["attack_type"] = "Port Scan"
+                    event["severity"] = "medium"
+                    event["reason"] = f"Multi-port probe ({unique_ports_contacted} ports) indicates Port Scan"
+                    with flow_lock:
+                        if key in flow_cache:
+                            flow_cache[key]["attack_type"] = "Port Scan"
+                            flow_cache[key]["severity"] = "medium"
+                            flow_cache[key]["reason"] = event["reason"]
+                    ml_accept = False
+                else:
+                    reason = f"ML Brute Force rejected: Insufficient single-port attempts ({same_port_attempts}/5 required)"
+
+            elif norm_ml_label == LABEL_DOS_DDOS:
+                if proto == "ICMP" and flow.get("packet_count", 0) >= 30:
+                    ml_accept = True
+                    event["attack_type"] = "ICMP Flood"  # Standardize display name for ICMP
+                    reason = f"ML ICMP Flood accepted ({flow.get('packet_count', 0)} ICMP packets, conf={ml_confidence:.2f})"
+                elif flow.get("packet_count", 0) >= 50 or (flow.get("packet_count", 0) / duration) >= 50 or ml_confidence >= 0.95:
+                    ml_accept = True
+                    reason = f"ML DDoS accepted (conf={ml_confidence:.2f})"
+
+            elif norm_ml_label == LABEL_EXFILTRATION:
+                if flow.get("byte_count", 0) >= 5_000_000 and ml_confidence >= 0.90:
+                    ml_accept = True
+                    reason = f"ML Exfiltration accepted (bytes={flow.get('byte_count', 0)}, conf={ml_confidence:.2f})"
+
+            if ml_accept:
+                event["ml_label"]      = norm_ml_label
+                event["ml_confidence"] = round(ml_confidence, 4)
+                event["attack_type"]   = "ICMP Flood" if proto == "ICMP" else to_display_name(norm_ml_label)
+                event["severity"]      = "high" if ml_confidence > 0.95 else "medium"
+                event["reason"]        = reason
+                with flow_lock:
+                    if key in flow_cache:
+                        flow_cache[key]["attack_type"] = event["attack_type"]
+                        flow_cache[key]["severity"]    = event["severity"]
+                        flow_cache[key]["reason"]      = reason
+                    pair = _live_pair_key(src_ip, dst_ip)
+                    if pair in _pair_window_buckets:
+                        _pair_window_buckets[pair]["attack_type"] = event["attack_type"]
+                        _pair_window_buckets[pair]["severity"] = event["severity"]
+            else:
+                # Do not leak unaccepted/rejected ML label to event object
+                event["ml_label"] = None
+                event["ml_confidence"] = None
+                if event.get("severity") and event.get("severity") != "none":
+                    with flow_lock:
+                        pair = _live_pair_key(src_ip, dst_ip)
+                        if pair in _pair_window_buckets:
+                            _pair_window_buckets[pair]["attack_type"] = event.get("attack_type", "Suspicious")
+                            _pair_window_buckets[pair]["severity"] = event.get("severity", "medium")
+
+            # Trigger immediate forecast update when attack is confirmed on wire
+            if event.get("attack_type") and event.get("attack_type") not in ("Benign", "Normal", "none", "") and event.get("severity") not in ("none", ""):
+                try:
+                    attack_win = {
+                        "duration": max(duration, 0.5),
+                        "packet_count": max(event.get("packet_count", 1), 10),
+                        "byte_count": max(event.get("byte_count", 0), 1000),
+                        "syn_flag": 1 if event.get("attack_type") in ("Port Scan", "SYN Flood", "DDoS") else 0,
+                        "ack_flag": 0,
+                        "rst_flag": 0,
+                        "fin_flag": 0,
+                        "dst_port": event.get("dst_port", 80),
+                        "src_port": event.get("src_port", 50000),
+                        "protocol": event.get("protocol", "TCP"),
+                        "flow_count": 1,
+                        "severity": event.get("severity", "high"),
+                        "attack_type": event.get("attack_type", "Port Scan"),
+                        "last_seen_ts": now_ts,
+                    }
+                    history = _append_live_window(src_ip, dst_ip, attack_win)
+                    _run_live_forecast(src_ip, dst_ip, history)
+                except Exception as _fe:
+                    pass
+
+            # Diagnostic logging (Requirement 12)
+            print(f"[CLASSIFY] src={src_ip}:{sport} dst={dst_ip}:{dport} proto={proto} | "
+                  f"unique_ports={unique_ports_contacted} same_port_att={same_port_attempts} | "
+                  f"ML=({ml_label}, {ml_confidence:.2f}) Heuristic={current_attack} -> "
+                  f"Final={event.get('attack_type')} | Reason={event.get('reason', reason)}")
+
+        except Exception as e:
+            print(f"[CLASSIFY ERROR] {e}")
+
+    if key in flow_cache and flow_cache[key].get("packet_count", 0) % 10 == 1:
+        try:
+            _log_live_flow(flow_cache[key])
+        except Exception:
+            pass
+
+    msg = json.dumps(event)
+    if _main_loop and not _main_loop.is_closed():
+        async def _send_all(message: str):
+            dead = []
+            for ws in list(connected_clients):
+                try:
+                    await ws.send_text(message)
+                except Exception:
+                    dead.append(ws)
+            for ws in dead:
+                if ws in connected_clients:
+                    connected_clients.remove(ws)
+        _main_loop.call_soon_threadsafe(
+            lambda m=msg: asyncio.ensure_future(_send_all(m), loop=_main_loop)
+        )
+
+
+def _wsl_capture_loop(iface: str):
+    """Sniff packets inside WSL environment using wsl_sniffer.py and process through main pipeline."""
+    active_captures[iface] = True
+    capture_stats["start_time"] = time.time()
+    capture_stats["total_packets"] = 0
+
+    wsl_internal_iface = "eth0"
+    if "(" in iface and ")" in iface:
+        wsl_internal_iface = iface.split("(")[1].split(")")[0]
+
+    script_win_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "wsl_sniffer.py"))
+    wsl_script_path = "/mnt/c/" + script_win_path[3:].replace('\\', '/')
+    try:
+        res = subprocess.run(
+            ["wsl.exe", "wslpath", "-u", script_win_path.replace("\\", "/")],
+            capture_output=True, text=True, timeout=5
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            wsl_script_path = res.stdout.strip()
+    except Exception:
+        pass
+
+    cmd = ["wsl.exe", "-u", "root", "python3", "-u", wsl_script_path, wsl_internal_iface]
+    print(f"[WSL Capture] Launching: {' '.join(cmd)}")
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
+        wsl_processes[iface] = proc
+
+        while active_captures.get(iface):
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    break
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+                if "error" in event:
+                    print(f"[WSL Capture Error] {event['error']}")
+                    break
+                _process_flow_event(event, iface)
+            except json.JSONDecodeError:
+                pass
+    except Exception as e:
+        print(f"[WSL Capture Exception] {iface}: {e}")
+    finally:
+        active_captures[iface] = False
+        proc = wsl_processes.pop(iface, None)
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        try:
+            subprocess.run(["wsl.exe", "-u", "root", "pkill", "-f", "wsl_sniffer.py"], capture_output=True, timeout=3)
+        except Exception:
+            pass
+        print(f"[WSL Capture] Terminated on {iface}")
+
+
+def _capture_loop(iface: str):
+    """Sniff packets on the given interface via Windows Npcap and broadcast to WebSocket clients."""
+    active_captures[iface] = True
+    capture_stats["start_time"] = time.time()
+    capture_stats["total_packets"] = 0
+
+    scapy_iface = _resolve_scapy_iface(iface)
+    print(f"[Capture] Sniffing on {iface} -> {scapy_iface}")
+
+    def process_packet(pkt):
+        if not active_captures.get(iface):
+            return False
+
+        try:
+            event = _packet_to_flow_event(pkt)
+            if event is None:
+                return
+            event["_scapy_pkt"] = pkt
+            _process_flow_event(event, iface)
+        except Exception:
+            pass
+
+    try:
+        sniff(
+            iface=scapy_iface,
+            prn=process_packet,
+            store=False,
+            stop_filter=lambda _: not active_captures.get(iface, False),
+        )
+    except Exception as e:
+        print(f"[Capture Error] {iface} ({scapy_iface}): {e}")
+    finally:
+        active_captures[iface] = False
+
+
+# ---------------------------------------------------------------------------
+# Stage Forecaster Background Task
+# ---------------------------------------------------------------------------
+
+_stage_forecaster = None
+
+def _lazy_load_stage_forecaster():
+    global _stage_forecaster
+    if _stage_forecaster is not None:
+        return True
+    try:
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from models.stage_forecaster_lstm_infer import forecast_host
+        _stage_forecaster = forecast_host
+        print('[ML] Stage forecaster loaded successfully.')
+        return True
+    except Exception as e:
+        print(f'[ML] Could not load stage forecaster: {e}')
+        return False
+
+_stage_forecast_task = None
+_finalize_call_count = 0
+
+def _ensure_stage_forecast_loop():
+    global _stage_forecast_task, _main_loop
+    try:
+        loop = _main_loop
+        if loop is None or loop.is_closed():
+            try:
+                loop = asyncio.get_event_loop()
+                _main_loop = loop
+            except Exception:
+                return
+        if _stage_forecast_task is None or _stage_forecast_task.done():
+            if loop.is_running():
+                _stage_forecast_task = loop.create_task(_stage_forecast_loop())
+                print("[LIVE_WINDOW_FINALIZER] Task ensured and spawned on running event loop.", flush=True)
+    except Exception as e:
+        print(f"[LIVE_WINDOW_FINALIZER_ERROR]\n{e}", flush=True)
+
+
+def _finalize_live_windows():
+    global _finalize_call_count
+    _finalize_call_count += 1
+    """Finalize 5-second live windows per REAL communication pair (src_ip, dst_ip).
+
+    Aggregates all traffic observed for each pair into 5-second fixed time windows,
+    appends finalized windows to LIVE_WINDOW_HISTORY[(src_ip, dst_ip)] (max 10 retained),
+    and emits status/forecast updates.
+    """
+    now = time.time()
+    cutoff = now - LIVE_WINDOW_SECONDS
+
+    with flow_lock:
+        # Clean up expired flows from flow_cache
+        expired_flow_keys = []
+        for key, flow in flow_cache.items():
+            try:
+                dt = datetime.fromisoformat(str(flow.get("last_seen", "")).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                last_seen = dt.timestamp()
+            except Exception:
+                last_seen = flow.get("first_seen_ts", now)
+
+            if last_seen <= cutoff:
+                expired_flow_keys.append(key)
+                src_ip = flow.get("src_ip", "")
+                dst_ip = flow.get("dst_ip", "")
+                if src_ip and dst_ip:
+                    pair = _live_pair_key(src_ip, dst_ip)
+                    if pair in _pair_window_buckets:
+                        _pair_window_buckets[pair]["last_seen_ts"] = min(
+                            _pair_window_buckets[pair].get("last_seen_ts", last_seen), last_seen
+                        )
+
+        for key in expired_flow_keys:
+            flow_cache.pop(key, None)
+
+        active_pairs = list(_pair_window_buckets.keys())
+
+        for pair in active_pairs:
+            src_ip, dst_ip = pair
+            bucket = _pair_window_buckets[pair]
+            win_start = bucket.get("window_start", now)
+            win_end = win_start + LIVE_WINDOW_SECONDS
+            history = LIVE_WINDOW_HISTORY.get(pair, [])
+
+            # Diagnostic logging — throttled to every 30 calls (~30 seconds) per pair to avoid log spam
+            if _finalize_call_count % 30 == 0:
+                print(f"[LIVE_WINDOW_DEBUG]\npair={src_ip}->{dst_ip}\nnow={now}\nbucket_start={win_start}\nbucket_end={win_end}\nflows_in_bucket={bucket.get('flow_count', 0)}\nhistory_length={len(history)}", flush=True)
+
+            # Window boundary condition: 5.0 seconds passed OR forced test expiration
+            if now >= win_end or bucket.get("last_seen_ts", 0) <= cutoff:
+                _ttl_list = bucket.get("ttl_list") or [64]
+                _win_list = bucket.get("win_list") or [0]
+                _payload_list = bucket.get("payload_list") or [0]
+                _pkt_ct = max(1, bucket.get("packet_count", 0))
+                _ttl_mean = sum(_ttl_list) / len(_ttl_list)
+                _ttl_var = sum((v - _ttl_mean) ** 2 for v in _ttl_list) / len(_ttl_list)
+                _win_mean = sum(_win_list) / len(_win_list)
+                _win_var = sum((v - _win_mean) ** 2 for v in _win_list) / len(_win_list)
+                _payload_mean = sum(_payload_list) / len(_payload_list)
+                _payload_var = sum((v - _payload_mean) ** 2 for v in _payload_list) / len(_payload_list)
+                _payload_std = _payload_var ** 0.5
+                _frag_ratio = bucket.get("frag_count", 0) / _pkt_ct
+
+                window = {
+                    "duration": round(min(5.0, max(0.001, now - win_start)), 6),
+                    "packet_count": max(1, bucket.get("packet_count", 0)),
+                    "byte_count": bucket.get("byte_count", 0),
+                    "syn_flag": bucket.get("syn_flag", 0),
+                    "ack_flag": bucket.get("ack_flag", 0),
+                    "rst_flag": bucket.get("rst_flag", 0),
+                    "fin_flag": bucket.get("fin_flag", 0),
+                    "dst_port": bucket.get("dst_port", 0),
+                    "src_port": bucket.get("src_port", 0),
+                    "protocol": bucket.get("protocol", "TCP"),
+                    "flow_count": bucket.get("flow_count", 0),
+                    "severity": bucket.get("severity", "none"),
+                    "attack_type": bucket.get("attack_type", "Benign"),
+                    "ttl_mean": round(_ttl_mean, 3),
+                    "ttl_var": round(_ttl_var, 3),
+                    "win_mean": round(_win_mean, 3),
+                    "win_var": round(_win_var, 3),
+                    "frag_ratio": round(_frag_ratio, 4),
+                    "payload_mean": round(_payload_mean, 3),
+                    "payload_std": round(_payload_std, 3),
+                    "retransmit_count": bucket.get("retransmit_count", 0),
+                    "last_seen_ts": now,
+                }
+
+                history = _append_live_window(src_ip, dst_ip, window)
+                history_len = len(history)
+
+                # Diagnostic logging on window completion (Required by prompt Step 2, 3, 5)
+                print(f"[REAL_WINDOW_FINALIZED]\nsrc={src_ip}\ndst={dst_ip}\nwindow_start={win_start:.3f}\nwindow_end={now:.3f}\npacket_count={window['packet_count']}\nbyte_count={window['byte_count']}\nfeature_count=14", flush=True)
+                print(f"[REAL_WINDOW_PROGRESS]\npair={src_ip}->{dst_ip}\nwindows={history_len}", flush=True)
+                print(f"[LIVE_WINDOW_FINALIZED]\npair={src_ip}->{dst_ip}\nfeature_count=14\nhistory_length={history_len}", flush=True)
+                print(f"[LIVE_WINDOW]\nsrc={src_ip}\ndst={dst_ip}\nwindows_collected={history_len}", flush=True)
+
+                if history_len == MIN_LIVE_WINDOWS:
+                    print(f"[LSTM_READY]\nsrc={src_ip}\ndst={dst_ip}\nwindows={history_len}\ninput_shape=(1,5,15)", flush=True)
+
+                # Live capture decoupled from forecast generation per requirements
+                pass
+
+                # Reset bucket for the NEXT 5-second window
+                _pair_window_buckets[pair] = {
+                    "window_start": win_end if (now - win_end < 10) else now,
+                    "packet_count": 0,
+                    "byte_count": 0,
+                    "syn_flag": 0,
+                    "ack_flag": 0,
+                    "rst_flag": 0,
+                    "fin_flag": 0,
+                    "dst_port": bucket.get("dst_port", 0),
+                    "src_port": bucket.get("src_port", 0),
+                    "protocol": bucket.get("protocol", "TCP"),
+                    "flow_count": 0,
+                    "severity": "none",
+                    "attack_type": "Benign",
+                    "last_seen_ts": now,
+                    "ttl_list": [],
+                    "win_list": [],
+                    "payload_list": [],
+                    "frag_count": 0,
+                    "retransmit_count": 0,
+                }
+
+
+def _run_live_forecast(src_ip: str, dst_ip: str, history: list):
+    """Run stage-forecaster inference for a REAL (src, dst) pair with a window history."""
+    pair_key = f"{src_ip}>{dst_ip}"
+    windows_collected = len(history)
+
+    if windows_collected == 0:
+        return
+
+    if not _lazy_load_stage_forecaster():
+        return
+
+    try:
+        pair_ident = _live_pair_key(src_ip, dst_ip)
+        risk_history = list(_host_risk_history[pair_ident])
+        forecast = _stage_forecaster(dst_ip, history, risk_history=risk_history, src_ip=src_ip)
+
+        if not forecast:
+            return
+
+        status = forecast.get("model_status", "")
+
+        if status == "UNAVAILABLE":
+            print(f"[LIVE_FORECAST_BROADCAST]\nsrc={src_ip}\ndst={dst_ip}\nwindows={windows_collected}\nmodel_status=UNAVAILABLE", flush=True)
+            return
+
+        predicted_stage = forecast.get("predicted_stage", "normal")
+        confidence = float(forecast.get("confidence", 0.0))
+        risk_score = float(forecast.get("risk_score", 0.0))
+
+        _host_risk_history[pair_ident].append(risk_score)
+        forecast["recent_risk_history"] = [round(float(r), 4) for r in list(_host_risk_history[pair_ident])]
+
+        # Attach the REAL communication pair to the forecast payload.
+        forecast["sourceIp"] = src_ip
+        forecast["targetIp"] = dst_ip
+        forecast["hostIp"] = dst_ip
+        forecast["status"] = "READY 10/10"
+        forecast["windows_collected"] = windows_collected
+        forecast["windowsCollected"] = windows_collected
+        forecast["min_windows_required"] = MIN_LIVE_WINDOWS
+        forecast["minRequired"] = MIN_LIVE_WINDOWS
+
+        print(f"[LIVE_FORECAST_UPDATE]\nsrc={src_ip}\ndst={dst_ip}\nwindows={windows_collected}\nstatus=READY", flush=True)
+        print(f"[LIVE_FORECAST_BROADCAST]\nsrc={src_ip}\ndst={dst_ip}\nwindows={windows_collected}\nmodel_status=READY", flush=True)
+        print(f"[LIVE_LSTM]\nsrc={src_ip}\ndst={dst_ip}\nwindows={windows_collected}\ninput_shape={tuple(forecast.get('input_shape') or (1, MIN_LIVE_WINDOWS, 14))}\nattack_probability={risk_score:.4f}\npredicted_stage={predicted_stage}", flush=True)
+
+        # Update the real live host registry with the latest forecast state.
+        _register_live_host(dst_ip, role="target", predicted_stage=predicted_stage,
+                            threat_level="high" if risk_score >= 0.5 else "medium" if risk_score >= 0.25 else "none")
+        _register_live_host(src_ip, role="source",
+                            threat_level="high" if risk_score >= 0.5 else "medium" if risk_score >= 0.25 else "none")
+
+        # Cache for the REST endpoint (keyed by the real pair).
+        _latest_stage_forecasts[pair_key] = forecast
+
+        # Broadcast to WebSocket clients.
+        if _main_loop and not _main_loop.is_closed():
+            msg = json.dumps({"type": "live_forecast_update", "data": forecast})
+
+            async def _send_forecasts(message):
+                dead = []
+                for ws in list(connected_clients):
+                    try:
+                        await ws.send_text(message)
+                    except Exception:
+                        dead.append(ws)
+                for ws in dead:
+                    if ws in connected_clients:
+                        connected_clients.remove(ws)
+
+            _main_loop.call_soon_threadsafe(
+                lambda m=msg: asyncio.ensure_future(_send_forecasts(m), loop=_main_loop)
+            )
+
+        # Attack alert: ONLY emitted when live behavioral attack evidence is verified in recent traffic
+        has_live_attack_evidence = any(
+            str(w.get("severity", "none")).lower() in ("critical", "high") or
+            str(w.get("attack_type", "Benign")).lower() not in ("benign", "none", "normal", "normal traffic", "")
+            for w in history[-2:]
+        )
+
+        if has_live_attack_evidence and predicted_stage != "normal" and risk_score >= LIVE_ALERT_THRESHOLD:
+            alert = {
+                "sourceIp": src_ip,
+                "targetIp": dst_ip,
+                "hostIp": dst_ip,
+                "predictedStage": predicted_stage,
+                "confidence": confidence,
+                "riskScore": risk_score,
+                "stageProbabilities": forecast.get("stage_probs", {}),
+                "windowsCollected": windows_collected,
+                "timestamp": datetime.utcnow().isoformat(),
+                "source": "live_capture",
+            }
+            print(f"[LIVE_ALERT] src={src_ip}\ndst={dst_ip}\nstage={predicted_stage}\nattack_probability={risk_score:.4f}", flush=True)
+
+            if _main_loop and not _main_loop.is_closed():
+                msg = json.dumps({"type": "live_forecast_alert", "data": alert})
+
+                async def _send_alert(message):
+                    dead = []
+                    for ws in list(connected_clients):
+                        try:
+                            await ws.send_text(message)
+                        except Exception:
+                            dead.append(ws)
+                    for ws in dead:
+                        if ws in connected_clients:
+                            connected_clients.remove(ws)
+
+                _main_loop.call_soon_threadsafe(
+                    lambda m=msg: asyncio.ensure_future(_send_alert(m), loop=_main_loop)
+                )
+    except Exception as e:
+        print(f"[LIVE_FORECAST ERROR] {src_ip} -> {dst_ip}: {e}", flush=True)
+
+
+async def _stage_forecast_loop():
+    """Background loop: finalize 5-second live windows per pair and run gated LSTM world-model inference."""
+    print("[LIVE_WINDOW_FINALIZER]\nstarted=true", flush=True)
+    loop_count = 0
+    while True:
+        try:
+            await asyncio.sleep(1.0)  # High-responsiveness live telemetry cadence (1s)
+            loop_count += 1
+            if loop_count % 3 == 0:
+                print("[LIVE_WINDOW_FINALIZER]\nrunning=true", flush=True)
+
+            _finalize_live_windows()
+        except Exception as e:
+            import traceback
+            print(f"[LIVE_WINDOW_FINALIZER_ERROR]\n{traceback.format_exc()}", flush=True)
+
+_latest_stage_forecasts = {}
+
+# ---------------------------------------------------------------------------
+# REST Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/interfaces")
+async def list_interfaces():
+    return await asyncio.to_thread(get_real_interfaces)
+
+
+@app.get("/api/forecasts")
+async def get_forecasts():
+    """Return latest LSTM stage forecasts for all active REAL (src, dst) pairs."""
+    return _latest_stage_forecasts
+
+
+@app.get("/api/live-hosts")
+async def get_live_hosts():
+    """Return all dynamically registered REAL live hosts (no demo substitution)."""
+    with flow_lock:
+        flow_srcs = {f.get("src_ip") for f in flow_cache.values() if f.get("src_ip")}
+        flow_dsts = {f.get("dst_ip") for f in flow_cache.values() if f.get("dst_ip")}
+    for ip in list(LIVE_HOSTS_DB.keys()):
+        host = LIVE_HOSTS_DB[ip]
+        host["isSource"] = ip in flow_srcs
+        host["isTarget"] = ip in flow_dsts
+        host["windowCount"] = sum(
+            len(h) for (s, d), h in LIVE_WINDOW_HISTORY.items() if ip in (s, d)
+        )
+    return list(LIVE_HOSTS_DB.values())
+
+
+@app.get("/api/live-windows")
+async def get_live_windows():
+    """Return per-pair live window collection status (windows_collected / required)."""
+    result = []
+    with flow_lock:
+        all_pairs = list(set(LIVE_WINDOW_HISTORY.keys()) | set(_pair_window_buckets.keys()))
+    for (src_ip, dst_ip) in all_pairs:
+        history = LIVE_WINDOW_HISTORY.get((src_ip, dst_ip), [])
+        w_len = len(history)
+        result.append({
+            "sourceIp": src_ip,
+            "targetIp": dst_ip,
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "windowsCollected": w_len,
+            "windows_collected": w_len,
+            "minRequired": MIN_LIVE_WINDOWS,
+            "min_windows_required": MIN_LIVE_WINDOWS,
+            "ready": w_len >= MIN_LIVE_WINDOWS,
+            "status": "READY" if w_len >= MIN_LIVE_WINDOWS else "WARMING UP",
+            "lastWindowTime": datetime.utcnow().isoformat(),
+        })
+    return result
+
+
+@app.get("/api/stats")
+async def get_stats():
+    with _raw_packet_lock:
+        raw_count = len(_raw_packet_buffer)
+    return {
+        "total_packets": capture_stats["total_packets"],
+        "raw_packet_count": raw_count,
+        "start_time": capture_stats["start_time"],
+        "active_captures": {k: v for k, v in active_captures.items() if v},
+        "flow_count": len(flow_cache),
+    }
+
+
+@app.get("/api/flows")
+async def get_flows(interface: str = None):
+    with flow_lock:
+        if interface:
+            flows = [f for f in flow_cache.values() if f.get("interface") == interface]
+        else:
+            flows = list(flow_cache.values())
+        return flows[-100:]
+
+
+@app.get("/api/interface-stats")
+async def get_interface_stats():
+    """Per-interface attack breakdown."""
+    with flow_lock:
+        stats = {}
+        for flow in flow_cache.values():
+            iface = flow.get("interface", "unknown")
+            if iface not in stats:
+                stats[iface] = {
+                    "interface": iface,
+                    "total_flows": 0,
+                    "total_packets": 0,
+                    "total_bytes": 0,
+                    "attack_flows": 0,
+                    "critical": 0,
+                    "high": 0,
+                    "medium": 0,
+                    "low": 0,
+                    "unique_src_ips": set(),
+                    "unique_dst_ips": set(),
+                }
+            s = stats[iface]
+            s["total_flows"] += 1
+            s["total_packets"] += flow["packet_count"]
+            s["total_bytes"] += flow["byte_count"]
+            sev = flow.get("severity", "none")
+            if sev != "none":
+                s["attack_flows"] += 1
+                if sev in ("critical", "high", "medium", "low"):
+                    s[sev] += 1
+            s["unique_src_ips"].add(flow["src_ip"])
+            s["unique_dst_ips"].add(flow["dst_ip"])
+
+        # Serialize sets to counts
+        result = []
+        for iface, s in stats.items():
+            result.append({
+                "interface": s["interface"],
+                "total_flows": s["total_flows"],
+                "total_packets": s["total_packets"],
+                "total_bytes": s["total_bytes"],
+                "attack_flows": s["attack_flows"],
+                "critical": s["critical"],
+                "high": s["high"],
+                "medium": s["medium"],
+                "low": s["low"],
+                "unique_src_ips": len(s["unique_src_ips"]),
+                "unique_dst_ips": len(s["unique_dst_ips"]),
+            })
+        return result
+
+
+@app.post("/api/capture/start/{iface}")
+async def start_capture(iface: str):
+    _start_iface_capture(iface)
+    return {"status": "started", "iface": iface}
+
+
+@app.post("/api/capture/switch/{iface}")
+async def switch_capture(iface: str):
+    _start_iface_capture(iface)
+    return {"status": "switched", "iface": iface}
+
+
+@app.post("/api/capture/stop/{iface}")
+async def stop_capture(iface: str):
+    active_captures[iface] = False
+    return {"status": "stopped", "iface": iface}
+
+
+@app.post("/api/capture/stop_all")
+async def stop_all_captures():
+    stop_all_captures_except(None)
+    return {"status": "all_stopped"}
+
+
+@app.post("/api/capture/reset")
+async def reset_capture_state():
+    reset_backend_state()
+    return {"status": "reset"}
+
+
+@app.get("/api/capture/status")
+async def capture_status():
+    return {k: v for k, v in active_captures.items()}
+
+
+def _sanitize_iface_name(iface: str) -> str:
+    """Sanitize interface name for safe filename usage."""
+    if not iface:
+        return "network"
+    s = iface.strip().lower()
+    if "wifi" in s or "wi-fi" in s or "wlan" in s or "wireless" in s:
+        return "wifi"
+    elif "ethernet" in s or "eth" in s or "local area" in s:
+        import re
+        m = re.search(r'ethernet[_\s]*(\d+)', s)
+        if m:
+            return f"ethernet_{m.group(1)}"
+        return "ethernet"
+    elif "wsl" in s:
+        return "wsl"
+    elif "loopback" in s:
+        return "loopback"
+    else:
+        import re
+        clean = re.sub(r'[^a-z0-9]+', '_', s).strip('_')
+        return clean or "network"
+
+
+@app.get("/api/capture/export-pcap")
+def export_capture_pcap(filename: str = None, interface: str = None):
+    """Export the raw packet buffer as a downloadable .pcap file."""
+    import tempfile
+    import traceback
+    from scapy.all import Ether, IP
+    from scapy.utils import wrpcap
+    from starlette.responses import Response
+
+    with _raw_packet_lock:
+        pkts = list(_raw_packet_buffer)
+
+    print(f"[PCAP EXPORT] Interface: '{interface}' | Session total_packets: {capture_stats['total_packets']} | Raw buffer count: {len(pkts)}", flush=True)
+
+    if not pkts:
+        raise HTTPException(
+            status_code=400,
+            detail="No captured packets available to export."
+        )
+
+    # Normalize packet linktypes so all packets have consistent Ethernet headers (DLT_EN10MB = 1)
+    normalized_pkts = []
+    for p in pkts:
+        try:
+            if isinstance(p, bytes):
+                if len(p) >= 20 and (p[0] & 0xf0) == 0x40:
+                    p = IP(p)
+                else:
+                    p = Ether(p)
+            if not getattr(p, "haslayer", None):
+                continue
+            if not p.haslayer(Ether):
+                p_norm = Ether(dst="ff:ff:ff:ff:ff:ff", src="00:00:00:00:00:00") / p
+                if hasattr(p, "time"):
+                    p_norm.time = p.time
+                normalized_pkts.append(p_norm)
+            else:
+                normalized_pkts.append(p)
+        except Exception as _pe:
+            print(f"[PCAP Normalization Warning] {_pe}")
+
+    if not normalized_pkts:
+        raise HTTPException(
+            status_code=400,
+            detail="No captured packets available to export."
+        )
+
+    clean_iface = _sanitize_iface_name(interface)
+    now = datetime.now()  # Local machine time
+    ts = now.strftime("%Y%m%d_%H%M%S")
+    default_filename = f"live_capture_{ts}.pcap"
+    out_filename = filename or default_filename
+    if not out_filename.endswith(".pcap"):
+        out_filename = f"{out_filename}.pcap"
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pcap", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        wrpcap(tmp_path, normalized_pkts)
+
+        with open(tmp_path, "rb") as f:
+            pcap_bytes = f.read()
+
+        return Response(
+            content=pcap_bytes,
+            media_type="application/vnd.tcpdump.pcap",
+            headers={
+                "Content-Disposition": f'attachment; filename="{out_filename}"',
+                "Access-Control-Expose-Headers": "Content-Disposition",
+            },
+        )
+    except Exception as e:
+        print(f"[PCAP Export Error] {e}\n{traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"PCAP export failed: {str(e)}"
+        )
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+@app.get("/api/live-data/status")
+async def live_data_status():
+    """Show status of live flow data collection for retraining."""
+    csv_path = _LIVE_FLOWS_CSV
+    exists = os.path.exists(csv_path)
+    size = 0
+    rows = 0
+    if exists:
+        size = os.path.getsize(csv_path)
+        try:
+            with open(csv_path, 'r') as f:
+                rows = sum(1 for _ in f) - 1  # subtract header
+        except Exception:
+            pass
+    return {
+        'csv_path': csv_path,
+        'exists': exists,
+        'size_bytes': size,
+        'flow_count': max(rows, 0),
+        'total_logged': _LIVE_FLOW_COUNT,
+        'max_flows': _MAX_LIVE_FLOWS,
+    }
+
+
+@app.post("/api/retrain")
+async def retrain_classifier():
+    """Retrain the XGBoost flow classifier on collected live data + CIC-IDS2017."""
+    csv_path = _LIVE_FLOWS_CSV
+    if not os.path.exists(csv_path):
+        return {"status": "error", "message": "No live data collected yet. Start a capture first."}
+
+    try:
+        import subprocess
+        script = os.path.join(os.path.dirname(__file__), '..', 'training', 'train_from_cic_ids2017.py')
+        cic_dir = r'C:\Users\htc\Downloads\MachineLearningCSV\MachineLearningCVE'
+        if not os.path.exists(cic_dir):
+            return {"status": "error", "message": f"CIC-IDS2017 dataset not found at {cic_dir}"}
+
+        # Run training in background
+        proc = subprocess.Popen(
+            [sys.executable, script, cic_dir, '--output-dir', os.path.join(os.path.dirname(__file__), '..', 'models')],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        # Don't wait — training takes minutes
+        return {
+            "status": "started",
+            "pid": proc.pid,
+            "message": "Retraining started in background. Check /api/live-data/status for completion.",
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# WebSocket for live packet streaming
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/live")
+async def websocket_live(ws: WebSocket):
+    await ws.accept()
+    connected_clients.append(ws)
+    try:
+        # Send initial stats
+        await ws.send_text(json.dumps({"type": "connected", "msg": "CyberForecaster capture stream active"}))
+        while True:
+            # Keep connection alive; also handle commands from client
+            data = await ws.receive_text()
+            try:
+                cmd = json.loads(data)
+                action = cmd.get("action")
+                if action == "start_capture":
+                    iface = cmd.get("interface")
+                    if iface:
+                        _start_iface_capture(iface)
+                        await ws.send_text(json.dumps({"type": "capture_started", "interface": iface}))
+                elif action == "switch_interface":
+                    iface = cmd.get("interface")
+                    if iface:
+                        _start_iface_capture(iface)
+                        await ws.send_text(json.dumps({"type": "interface_switched", "interface": iface}))
+                elif action == "stop_capture":
+                    iface = cmd.get("interface")
+                    stop_all_captures_except(None)
+                    await ws.send_text(json.dumps({"type": "capture_stopped", "interface": iface}))
+                elif action == "stop_all":
+                    stop_all_captures_except(None)
+                    await ws.send_text(json.dumps({"type": "all_captures_stopped"}))
+                elif action == "get_flows":
+                    target_iface = cmd.get("interface")
+                    with flow_lock:
+                        if target_iface:
+                            flows = [f for f in flow_cache.values() if f.get("interface") == target_iface]
+                        else:
+                            flows = list(flow_cache.values())
+                        flows_snapshot = flows[-50:]
+                    await ws.send_text(json.dumps({"type": "flows_snapshot", "interface": target_iface, "flows": flows_snapshot}))
+            except json.JSONDecodeError:
+                pass
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if ws in connected_clients:
+            connected_clients.remove(ws)
+
+
+# ---------------------------------------------------------------------------
+# Defense Action State
+# ---------------------------------------------------------------------------
+defense_state: dict[str, dict] = {
+    # iface -> { firewall_raised: bool, blocked_ips: set, rate_limited_ips: set, isolated_ports: set }
+}
+
+
+def _get_defense(iface: str) -> dict:
+    if iface not in defense_state:
+        defense_state[iface] = {
+            "firewall_raised": False,
+            "blocked_ips": set(),
+            "rate_limited_ips": set(),
+            "isolated_ports": set(),
+        }
+    return defense_state[iface]
+
+
+def _run_system_cmd(cmd: list[str], description: str) -> dict:
+    """Execute a system command for firewall/network actions. Returns status dict."""
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        ok = result.returncode == 0
+        print(f"[Defense] {description}: {'OK' if ok else 'FAILED'} - {result.stdout.strip() or result.stderr.strip()}")
+        return {"success": ok, "output": result.stdout.strip() or result.stderr.strip()}
+    except FileNotFoundError:
+        # Command not found (e.g. iptables on Windows) — use local state tracking
+        print(f"[Defense] {description}: Command not found, tracking locally")
+        return {"success": True, "output": "Tracked locally (command not available on this OS)"}
+    except Exception as e:
+        print(f"[Defense] {description}: Error - {e}")
+        return {"success": False, "output": str(e)}
+
+
+def is_valid_ip(ip_str: str) -> bool:
+    """Validate IP address format server-side safely."""
+    if not ip_str or not isinstance(ip_str, str):
+        return False
+    try:
+        ipaddress.ip_address(ip_str.strip())
+        return True
+    except ValueError:
+        return False
+
+
+def _raise_firewall(iface: str) -> dict:
+    """Block all incoming traffic on the given interface."""
+    d = _get_defense(iface)
+    d["firewall_raised"] = True
+    if sys.platform == "win32":
+        rule_name = f"AETHERIS_Block_In_{iface.replace(' ', '_')}"
+        return _run_system_cmd(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             f"name={rule_name}", "dir=in", "action=block",
+             "enable=yes", "profile=any"],
+            f"Raise firewall on {iface}"
+        )
+    else:
+        return _run_system_cmd(
+            ["iptables", "-A", "INPUT", "-i", iface, "-j", "DROP"],
+            f"Raise firewall on {iface}"
+        )
+
+
+def _drop_firewall(iface: str) -> dict:
+    """Remove firewall rules for the given interface."""
+    d = _get_defense(iface)
+    d["firewall_raised"] = False
+    if sys.platform == "win32":
+        rule_name = f"AETHERIS_Block_In_{iface.replace(' ', '_')}"
+        return _run_system_cmd(
+            ["netsh", "advfirewall", "firewall", "delete", "rule",
+             f"name={rule_name}"],
+            f"Drop firewall on {iface}"
+        )
+    else:
+        return _run_system_cmd(
+            ["iptables", "-D", "INPUT", "-i", iface, "-j", "DROP"],
+            f"Drop firewall on {iface}"
+        )
+
+
+# Block list registry (in-memory, synchronized with OS firewall store)
+_block_registry: dict[str, dict] = {}
+
+
+def get_protected_ips() -> set[str]:
+    """Get all IPs that must NEVER be blocked (loopback, physical machine LAN IP, default gateway). Excludes WSL IPs."""
+    protected = {"127.0.0.1", "::1", "0.0.0.0", "localhost"}
+    wsl_info = _get_wsl_info()
+    wsl_ips_set = set(wsl_info["wsl_ips"])
+    if wsl_info.get("vethernet_ip"):
+        wsl_ips_set.add(wsl_info["vethernet_ip"])
+
+    try:
+        for iface in get_real_interfaces():
+            name = iface.get("name", "").lower()
+            if "wsl" in name or "vethernet" in name:
+                continue
+            ip = iface.get("ip")
+            if ip and is_valid_ip(ip) and ip not in wsl_ips_set:
+                protected.add(ip)
+    except Exception:
+        pass
+    try:
+        hostname = socket.gethostname()
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if is_valid_ip(ip) and ip not in wsl_ips_set:
+                protected.add(ip)
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            proc = subprocess.run(
+                ["powershell.exe", "-Command", "Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NextHop"],
+                capture_output=True, text=True, timeout=3
+            )
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    gw = line.strip()
+                    if gw and is_valid_ip(gw):
+                        protected.add(gw)
+        except Exception:
+            pass
+    return protected
+
+
+_cached_wsl_info: dict | None = None
+_cached_wsl_info_time: float = 0.0
+
+def _get_wsl_info() -> dict:
+    """Detect WSL status, WSL internal IPs, and vEthernet WSL adapter IP (cached for 60s)."""
+    global _cached_wsl_info, _cached_wsl_info_time
+    now = time.time()
+    if _cached_wsl_info is not None and (now - _cached_wsl_info_time) < 60.0:
+        return _cached_wsl_info
+
+    info = {"available": False, "wsl_ips": [], "vethernet_ip": None}
+    try:
+        proc = subprocess.run(["wsl", "-u", "root", "hostname", "-I"], capture_output=True, text=True, timeout=2)
+        if proc.returncode == 0 and proc.stdout.strip():
+            info["available"] = True
+            info["wsl_ips"] = [ip.strip() for ip in proc.stdout.strip().split() if is_valid_ip(ip.strip())]
+    except Exception:
+        pass
+
+    if sys.platform == "win32":
+        try:
+            proc_v = subprocess.run([
+                "powershell.exe", "-Command",
+                "Get-NetIPAddress -InterfaceAlias '*WSL*' -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty IPAddress"
+            ], capture_output=True, text=True, timeout=2)
+            if proc_v.returncode == 0 and proc_v.stdout.strip():
+                line = proc_v.stdout.strip().splitlines()[0].strip()
+                if is_valid_ip(line):
+                    info["vethernet_ip"] = line
+        except Exception:
+            pass
+    _cached_wsl_info = info
+    _cached_wsl_info_time = now
+    return info
+
+
+def _verify_netsh_rule(rule_name: str) -> bool:
+    """Verify if a netsh firewall rule exists in Windows Defender Firewall."""
+    if sys.platform != "win32":
+        return False
+    try:
+        proc = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"],
+            capture_output=True, text=True, timeout=5
+        )
+        return proc.returncode == 0 and ("Rule Name:" in proc.stdout or "CyberForecaster" in proc.stdout or "AETHERIS" in proc.stdout)
+    except Exception:
+        return False
+
+
+def _verify_wsl_iptables_rule(ip: str, direction: str = "INPUT") -> bool:
+    """Verify if an iptables DROP rule exists in WSL."""
+    try:
+        if direction == "INPUT":
+            cmd = ["wsl", "-u", "root", "iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"]
+        else:
+            cmd = ["wsl", "-u", "root", "iptables", "-C", "OUTPUT", "-d", ip, "-j", "DROP"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+_sync_in_progress: bool = False
+
+def _sync_live_block_state_worker():
+    global _block_registry, _sync_in_progress
+    active_blocks = {}
+    try:
+        if sys.platform == "win32":
+            proc = subprocess.run(
+                ["netsh", "advfirewall", "firewall", "show", "rule", "name=all"],
+                capture_output=True, text=True, timeout=3
+            )
+            if proc.returncode == 0 and proc.stdout:
+                for line in proc.stdout.splitlines():
+                    if "Rule Name:" in line:
+                        name = line.split("Rule Name:", 1)[1].strip()
+                        if name.startswith("CyberForecaster_Block_"):
+                            parts = name.rsplit("_", 1)
+                            if len(parts) == 2:
+                                ip_part = parts[0].replace("CyberForecaster_Block_", "").replace("_", ".")
+                                if is_valid_ip(ip_part):
+                                    if ip_part not in active_blocks:
+                                        active_blocks[ip_part] = {
+                                            "ip": ip_part, "source": "wifi",
+                                            "timestamp": datetime.now().isoformat(),
+                                            "rules": [], "wsl_blocked": False, "verified": True
+                                        }
+                                    active_blocks[ip_part]["rules"].append(name)
+                        elif name.startswith("AETHERIS_Block_IP_"):
+                            ip_part = name.replace("AETHERIS_Block_IP_", "").replace("_", ".")
+                            if is_valid_ip(ip_part):
+                                if ip_part not in active_blocks:
+                                    active_blocks[ip_part] = {
+                                        "ip": ip_part, "source": "wifi",
+                                        "timestamp": datetime.now().isoformat(),
+                                        "rules": [name], "wsl_blocked": False, "verified": True
+                                    }
+    except Exception:
+        pass
+
+    if active_blocks:
+        _block_registry.update(active_blocks)
+        all_blocked_ips = set(_block_registry.keys())
+        for iface in defense_state:
+            defense_state[iface]["blocked_ips"] = set(all_blocked_ips)
+    _sync_in_progress = False
+
+
+def _sync_live_block_state(blocking: bool = False):
+    """Synchronize live firewall block state in background without blocking server or APIs."""
+    global _sync_in_progress
+    if blocking:
+        _sync_live_block_state_worker()
+    else:
+        if not _sync_in_progress:
+            _sync_in_progress = True
+            threading.Thread(target=_sync_live_block_state_worker, daemon=True).start()
+
+
+def _block_ip(ip: str, iface: str = None) -> dict:
+    """Block a specific source IP using Windows Defender Firewall (netsh) and WSL iptables."""
+    ip_clean = (ip or "").strip()
+    if not is_valid_ip(ip_clean):
+        return {"success": False, "output": f"Invalid IP address format: '{ip}'"}
+
+    # Validation: Reject local machine IP, loopback, gateway
+    protected = get_protected_ips()
+    if ip_clean in protected:
+        print(f"[Defense] Refusing to block protected IP: {ip_clean}")
+        return {"success": False, "output": f"Refusing to block local machine IP / gateway / loopback: '{ip_clean}'"}
+
+    wsl_info = _get_wsl_info()
+    is_wsl_target = (
+        ip_clean in wsl_info["wsl_ips"] or
+        ip_clean == wsl_info.get("vethernet_ip") or
+        (iface and "wsl" in iface.lower())
+    )
+
+    if is_wsl_target and not wsl_info["available"]:
+        return {"success": False, "output": f"Target IP '{ip_clean}' is a WSL host, but WSL is not running or not installed."}
+
+    rule_in = f"CyberForecaster_Block_{ip_clean}_In"
+    rule_out = f"CyberForecaster_Block_{ip_clean}_Out"
+
+    netsh_success = False
+    wsl_success = False
+    outputs = []
+
+    # 1. Apply Windows Firewall netsh rules (dir=in and dir=out)
+    if sys.platform == "win32":
+        add_in = ["netsh", "advfirewall", "firewall", "add", "rule", f"name={rule_in}", "dir=in", "action=block", f"remoteip={ip_clean}"]
+        add_out = ["netsh", "advfirewall", "firewall", "add", "rule", f"name={rule_out}", "dir=out", "action=block", f"remoteip={ip_clean}"]
+
+        r_in = _run_system_cmd(add_in, f"Netsh Block Inbound {ip_clean}")
+        r_out = _run_system_cmd(add_out, f"Netsh Block Outbound {ip_clean}")
+
+        if not (r_in["success"] and r_out["success"]):
+            elev_cmd = [
+                "powershell.exe", "-Command",
+                f"Start-Process powershell -ArgumentList '-Command netsh advfirewall firewall add rule name={rule_in} dir=in action=block remoteip={ip_clean}; netsh advfirewall firewall add rule name={rule_out} dir=out action=block remoteip={ip_clean}' -Verb RunAs -Wait"
+            ]
+            _run_system_cmd(elev_cmd, f"Elevated Netsh Block {ip_clean}")
+
+        # Verify creation via netsh show rule
+        ver_in = _verify_netsh_rule(rule_in)
+        if ver_in:
+            netsh_success = True
+            outputs.append(f"Windows Firewall rules '{rule_in}' / '{rule_out}' verified.")
+        else:
+            outputs.append(f"Windows Firewall rule '{rule_in}' creation failed or not verified (Elevation required).")
+
+        # Terminate active TCP connections
+        try:
+            subprocess.run([
+                "powershell.exe", "-Command",
+                f"Get-NetTCPConnection -RemoteAddress '{ip_clean}' -ErrorAction SilentlyContinue | Remove-NetTCPConnection -Confirm:$false -ErrorAction SilentlyContinue"
+            ], capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+    # 2. Apply WSL iptables rules (handles Demo 2 and WSL traffic)
+    if wsl_info["available"]:
+        wsl_ips_to_block = [ip_clean]
+        if is_wsl_target:
+            wsl_ips_to_block.extend(wsl_info["wsl_ips"])
+            if wsl_info.get("vethernet_ip"):
+                wsl_ips_to_block.append(wsl_info["vethernet_ip"])
+        wsl_ips_to_block = list(set(wsl_ips_to_block))
+
+        wsl_ok_count = 0
+        for target in wsl_ips_to_block:
+            if target in protected:
+                continue
+            try:
+                if not _verify_wsl_iptables_rule(target, "INPUT"):
+                    subprocess.run(["wsl", "-u", "root", "iptables", "-A", "INPUT", "-s", target, "-j", "DROP"], capture_output=True, timeout=5)
+                if not _verify_wsl_iptables_rule(target, "OUTPUT"):
+                    subprocess.run(["wsl", "-u", "root", "iptables", "-A", "OUTPUT", "-d", target, "-j", "DROP"], capture_output=True, timeout=5)
+                if _verify_wsl_iptables_rule(target, "INPUT"):
+                    wsl_ok_count += 1
+            except Exception as e:
+                print(f"[Defense] WSL block error for {target}: {e}")
+
+        if wsl_ok_count > 0:
+            wsl_success = True
+            outputs.append(f"WSL iptables rules verified for {wsl_ok_count} IP(s).")
+
+    overall_success = netsh_success or wsl_success
+
+    if overall_success:
+        source_type = "both" if (netsh_success and wsl_success) else ("wsl" if wsl_success else "wifi")
+        _block_registry[ip_clean] = {
+            "ip": ip_clean,
+            "source": source_type,
+            "timestamp": datetime.now().isoformat(),
+            "rules": [rule_in, rule_out],
+            "wsl_blocked": wsl_success,
+            "verified": True,
+        }
+        if iface:
+            _get_defense(iface)["blocked_ips"].add(ip_clean)
+        for f_iface in defense_state:
+            defense_state[f_iface]["blocked_ips"].add(ip_clean)
+
+        return {
+            "success": True,
+            "output": " | ".join(outputs)
+        }
+    else:
+        return {
+            "success": False,
+            "output": " | ".join(outputs) or "Failed to apply block rules on Windows Firewall or WSL."
+        }
+
+
+def _unblock_ip(ip: str, iface: str = None) -> dict:
+    """Unblock a previously blocked attacking source IP from Windows Firewall and WSL iptables."""
+    ip_clean = (ip or "").strip()
+    if not is_valid_ip(ip_clean):
+        return {"success": False, "output": f"Invalid IP address format: '{ip}'"}
+
+    rule_in = f"CyberForecaster_Block_{ip_clean}_In"
+    rule_out = f"CyberForecaster_Block_{ip_clean}_Out"
+
+    netsh_unblocked = True
+    wsl_unblocked = True
+    outputs = []
+
+    # 1. Delete Windows Firewall netsh rules
+    if sys.platform == "win32":
+        del_in = ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_in}"]
+        del_out = ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_out}"]
+
+        r_in = _run_system_cmd(del_in, f"Netsh Delete {rule_in}")
+        r_out = _run_system_cmd(del_out, f"Netsh Delete {rule_out}")
+
+        if not (r_in["success"] and r_out["success"]):
+            elev_cmd = [
+                "powershell.exe", "-Command",
+                f"Start-Process powershell -ArgumentList '-Command netsh advfirewall firewall delete rule name={rule_in}; netsh advfirewall firewall delete rule name={rule_out}' -Verb RunAs -Wait"
+            ]
+            _run_system_cmd(elev_cmd, f"Elevated Netsh Delete {ip_clean}")
+
+        # Verify removal via netsh show rule
+        if _verify_netsh_rule(rule_in):
+            netsh_unblocked = False
+            outputs.append(f"Failed to remove Windows Firewall rule '{rule_in}'.")
+        else:
+            outputs.append(f"Windows Firewall rules '{rule_in}' / '{rule_out}' removed and verified.")
+
+    # 2. Delete WSL iptables rules
+    wsl_info = _get_wsl_info()
+    if wsl_info["available"]:
+        is_wsl_target = (
+            ip_clean in wsl_info["wsl_ips"] or
+            ip_clean == wsl_info.get("vethernet_ip") or
+            (iface and "wsl" in iface.lower())
+        )
+        wsl_ips_to_unblock = [ip_clean]
+        if is_wsl_target:
+            wsl_ips_to_unblock.extend(wsl_info["wsl_ips"])
+            if wsl_info.get("vethernet_ip"):
+                wsl_ips_to_unblock.append(wsl_info["vethernet_ip"])
+        wsl_ips_to_unblock = list(set(wsl_ips_to_unblock))
+
+        for target in wsl_ips_to_unblock:
+            try:
+                while _verify_wsl_iptables_rule(target, "INPUT"):
+                    subprocess.run(["wsl", "-u", "root", "iptables", "-D", "INPUT", "-s", target, "-j", "DROP"], capture_output=True, timeout=5)
+                while _verify_wsl_iptables_rule(target, "OUTPUT"):
+                    subprocess.run(["wsl", "-u", "root", "iptables", "-D", "OUTPUT", "-d", target, "-j", "DROP"], capture_output=True, timeout=5)
+
+                if _verify_wsl_iptables_rule(target, "INPUT") or _verify_wsl_iptables_rule(target, "OUTPUT"):
+                    wsl_unblocked = False
+            except Exception:
+                pass
+
+        if wsl_unblocked:
+            outputs.append("WSL iptables rules removed and verified.")
+        else:
+            outputs.append("WSL iptables rules removal incomplete.")
+
+    overall_unblocked = netsh_unblocked and wsl_unblocked
+
+    if overall_unblocked:
+        _block_registry.pop(ip_clean, None)
+        if iface:
+            _get_defense(iface)["blocked_ips"].discard(ip_clean)
+        for f_iface in defense_state:
+            defense_state[f_iface]["blocked_ips"].discard(ip_clean)
+
+        return {
+            "success": True,
+            "output": " | ".join(outputs)
+        }
+    else:
+        return {
+            "success": False,
+            "output": " | ".join(outputs) or "Failed to completely unblock rules."
+        }
+
+
+def _rate_limit_ip(ip: str, iface: str = None) -> dict:
+    """Apply rate limiting to a specific IP (max 10 packets/sec)."""
+    ip_clean = (ip or "").strip()
+    if not is_valid_ip(ip_clean):
+        return {"success": False, "output": f"Invalid IP address format: '{ip}'"}
+
+    if iface:
+        d = _get_defense(iface)
+        d["rate_limited_ips"].add(ip_clean)
+
+    sanitized_ip = ip_clean.replace(".", "_").replace(":", "_")
+    rule_name = f"AETHERIS_RateLimit_{sanitized_ip}"
+
+    if sys.platform == "win32":
+        return _run_system_cmd(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             f"name={rule_name}", "dir=in", "action=block",
+             f"remoteip={ip_clean}", "enable=yes", "profile=any"],
+            f"Rate limit IP {ip_clean}"
+        )
+    else:
+        cmd = ["iptables", "-A", "INPUT", "-s", ip_clean, "-m", "limit",
+               "--limit", "10/sec", "--limit-burst", "20", "-j", "ACCEPT"]
+        result = _run_system_cmd(cmd, f"Rate limit IP {ip_clean} (accept)")
+        cmd2 = ["iptables", "-A", "INPUT", "-s", ip_clean, "-j", "DROP"]
+        _run_system_cmd(cmd2, f"Rate limit IP {ip_clean} (drop excess)")
+        return result
+
+
+def _unrate_limit_ip(ip: str, iface: str = None) -> dict:
+    """Remove rate limiting from a specific IP."""
+    ip_clean = (ip or "").strip()
+    if not is_valid_ip(ip_clean):
+        return {"success": False, "output": f"Invalid IP address format: '{ip}'"}
+
+    if iface:
+        d = _get_defense(iface)
+        d["rate_limited_ips"].discard(ip_clean)
+
+    sanitized_ip = ip_clean.replace(".", "_").replace(":", "_")
+    rule_name = f"AETHERIS_RateLimit_{sanitized_ip}"
+
+    if sys.platform == "win32":
+        return _run_system_cmd(
+            ["netsh", "advfirewall", "firewall", "delete", "rule",
+             f"name={rule_name}"],
+            f"Remove rate limit IP {ip_clean}"
+        )
+    else:
+        _run_system_cmd(
+            ["iptables", "-D", "INPUT", "-s", ip_clean, "-m", "limit",
+             "--limit", "10/sec", "--limit-burst", "20", "-j", "ACCEPT"],
+            f"Remove rate limit IP {ip_clean} (accept)"
+        )
+        return _run_system_cmd(
+            ["iptables", "-D", "INPUT", "-s", ip_clean, "-j", "DROP"],
+            f"Remove rate limit IP {ip_clean} (drop)"
+        )
+
+
+def _isolate_port(port: int, iface: str = None) -> dict:
+    """Block a specific port on the interface."""
+    if iface:
+        d = _get_defense(iface)
+        d["isolated_ports"].add(port)
+    if sys.platform == "win32":
+        rule_name = f"AETHERIS_Isolate_Port_{port}"
+        cmd = ["netsh", "advfirewall", "firewall", "add", "rule",
+               f"name={rule_name}", "dir=in", "action=block",
+               "protocol=tcp", f"localport={port}",
+               "enable=yes", "profile=any"]
+        return _run_system_cmd(cmd, f"Isolate port {port}")
+    else:
+        cmd = ["iptables", "-A", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "DROP"]
+        return _run_system_cmd(cmd, f"Isolate port {port}")
+
+
+def _unisolate_port(port: int, iface: str = None) -> dict:
+    """Remove port isolation."""
+    if iface:
+        d = _get_defense(iface)
+        d["isolated_ports"].discard(port)
+    if sys.platform == "win32":
+        rule_name = f"AETHERIS_Isolate_Port_{port}"
+        return _run_system_cmd(
+            ["netsh", "advfirewall", "firewall", "delete", "rule",
+             f"name={rule_name}"],
+            f"Remove port isolation {port}"
+        )
+    else:
+        return _run_system_cmd(
+            ["iptables", "-D", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "DROP"],
+            f"Remove port isolation {port}"
+        )
+
+
+# Pydantic models for defense actions
+class FirewallAction(BaseModel):
+    interface: str
+
+class IPAaction(BaseModel):
+    ip: str
+    interface: Optional[str] = None
+
+class PortAction(BaseModel):
+    port: int
+    interface: Optional[str] = None
+
+
+# Defense action endpoints
+@app.post("/api/defense/firewall/raise")
+async def raise_firewall(action: FirewallAction):
+    result = _raise_firewall(action.interface)
+    return {"status": "raised" if result["success"] else "failed", **result}
+
+
+@app.post("/api/defense/firewall/drop")
+async def drop_firewall(action: FirewallAction):
+    result = _drop_firewall(action.interface)
+    return {"status": "dropped" if result["success"] else "failed", **result}
+
+
+@app.post("/api/defense/block-ip")
+async def block_ip_action(action: IPAaction):
+    result = _block_ip(action.ip, action.interface)
+    return {"status": "blocked" if result["success"] else "failed", **result}
+
+
+@app.post("/api/defense/unblock-ip")
+async def unblock_ip_action(action: IPAaction):
+    result = _unblock_ip(action.ip, action.interface)
+    return {"status": "unblocked" if result["success"] else "failed", **result}
+
+
+@app.post("/api/defense/rate-limit")
+async def rate_limit_action(action: IPAaction):
+    result = _rate_limit_ip(action.ip, action.interface)
+    return {"status": "rate_limited" if result["success"] else "failed", **result}
+
+
+@app.post("/api/defense/unrate-limit")
+async def unrate_limit_action(action: IPAaction):
+    result = _unrate_limit_ip(action.ip, action.interface)
+    return {"status": "unrate_limited" if result["success"] else "failed", **result}
+
+
+@app.post("/api/defense/isolate-port")
+async def isolate_port_action(action: PortAction):
+    result = _isolate_port(action.port, action.interface)
+    return {"status": "isolated" if result["success"] else "failed", **result}
+
+
+@app.post("/api/defense/unisolate-port")
+async def unisolate_port_action(action: PortAction):
+    result = _unisolate_port(action.port, action.interface)
+    return {"status": "unisolated" if result["success"] else "failed", **result}
+
+
+@app.get("/api/defense/state")
+async def get_defense_state():
+    """Return current defense state for all interfaces instantly."""
+    result = {}
+    for iface, state in defense_state.items():
+        result[iface] = {
+            "firewall_raised": state["firewall_raised"],
+            "blocked_ips": list(state["blocked_ips"]),
+            "rate_limited_ips": list(state["rate_limited_ips"]),
+            "isolated_ports": list(state["isolated_ports"]),
+        }
+    return result
+
+
+@app.get("/api/defense/block-list")
+async def get_block_list():
+    """Return detailed live block registry instantly."""
+    return {"blocked_ips": list(_block_registry.values())}
+
+
+# ---------------------------------------------------------------------------
+# File Upload & Offline Analysis Endpoint (/api/upload)
+# ---------------------------------------------------------------------------
+
+
+
+
+EXTRACTOR_PATH = os.environ.get("EXTRACTOR_PATH", r"C:\ml-data\extract_packet_features_v2.py")
+
+
+def _get_extractor_module():
+    """Dynamically import extract_packet_features_v2 from EXTRACTOR_PATH or local extractor package."""
+    import importlib.util
+    if os.path.exists(EXTRACTOR_PATH):
+        try:
+            spec = importlib.util.spec_from_file_location("extract_packet_features_v2", EXTRACTOR_PATH)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        except Exception as e:
+            print(f"[Extractor Import Warning] Failed loading from {EXTRACTOR_PATH}: {e}", flush=True)
+    try:
+        from extractor import extract_packet_features_v2 as mod
+        return mod
+    except Exception as e:
+        raise ImportError(f"Could not import extract_packet_features_v2 module: {e}")
+
+
+def _run_extractor_on_pcap(pcap_path: str, known_clean: bool = False, keep_csv: str = None) -> pd.DataFrame:
+    """Run extract_packet_features_v2 on a PCAP file and return DataFrame with exact 24 columns."""
+    import tempfile
+    import csv
+    import pandas as pd
+
+    ext_mod = _get_extractor_module()
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp_csv:
+        tmp_csv_path = tmp_csv.name
+
+    try:
+        ext_mod.extract(pcap_path, tmp_csv_path)
+        if keep_csv:
+            import shutil
+            shutil.copyfile(tmp_csv_path, keep_csv)
+
+        rows = []
+        with open(tmp_csv_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                r["label"] = "Benign" if known_clean else ""
+                r["attack_stage"] = "normal" if known_clean else ""
+                rows.append(r)
+
+        fieldnames = [
+            "src_ip", "dst_ip", "src_port", "dst_port", "protocol",
+            "flow_start", "flow_end", "duration", "packet_count", "byte_count",
+            "syn_count", "ack_count", "fin_count", "rst_count",
+            "ttl_mean", "ttl_var", "win_mean", "win_var",
+            "frag_ratio", "payload_mean", "payload_std", "retransmit_count",
+            "iat_mean", "iat_std", "bwd_fwd_ratio",
+            "label", "attack_stage"
+        ]
+        df = pd.DataFrame(rows, columns=fieldnames)
+        return df
+    finally:
+        if os.path.exists(tmp_csv_path):
+            try:
+                os.remove(tmp_csv_path)
+            except Exception:
+                pass
+
+
+def _pcap_bytes_to_flow_df(content: bytes, keep_csv: str = None) -> pd.DataFrame:
+    """Extract flows using extract_packet_features_v2 so PCAP and CSV uploads produce identical data."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".pcap", delete=False) as tmp_pcap:
+        tmp_pcap.write(content)
+        tmp_pcap_path = tmp_pcap.name
+
+    try:
+        df = _run_extractor_on_pcap(tmp_pcap_path, known_clean=False, keep_csv=keep_csv)
+        REQUIRED_COLUMNS = [
+            "src_ip", "dst_ip", "src_port", "dst_port", "protocol", "flow_start", "flow_end",
+            "duration", "packet_count", "byte_count", "syn_count", "ack_count", "fin_count",
+            "rst_count", "ttl_mean", "ttl_var", "win_mean", "win_var", "frag_ratio",
+            "payload_mean", "payload_std", "retransmit_count"
+        ]
+        if df.empty:
+            raise ValueError("No valid IP network packets/flows found in PCAP file.")
+        return df[REQUIRED_COLUMNS]
+    except Exception as e:
+        raise ValueError(f"Extractor failed to parse PCAP file: {e}")
+    finally:
+        if os.path.exists(tmp_pcap_path):
+            try:
+                os.remove(tmp_pcap_path)
+            except Exception:
+                pass
+
+
+_latest_forecast_result = {"status": "no_upload"}
+_LATEST_FORECAST_FILE = os.path.join(_LIVE_DATA_DIR, 'latest_forecast.json')
+
+
+def _save_latest_forecast(data: dict):
+    global _latest_forecast_result
+    _latest_forecast_result = data
+    try:
+        os.makedirs(_LIVE_DATA_DIR, exist_ok=True)
+        with open(_LATEST_FORECAST_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[Latest Forecast Save Error]: {e}", flush=True)
+
+
+def _get_latest_forecast() -> dict:
+    global _latest_forecast_result
+    return _latest_forecast_result
+
+
+TARGET_24_COLUMNS = [
+    "src_ip", "dst_ip", "src_port", "dst_port", "protocol", "flow_start", "flow_end",
+    "duration", "packet_count", "byte_count", "syn_count", "ack_count", "fin_count",
+    "rst_count", "ttl_mean", "ttl_var", "win_mean", "win_var", "frag_ratio",
+    "payload_mean", "payload_std", "retransmit_count", "label", "attack_stage"
+]
+
+
+def _adapt_arbitrary_csv_to_schema(df):
+    """
+    Adapts arbitrary network flow CSVs (including raw CICFlowMeter exports) into our 24-column target schema.
+    Returns DataFrame with exact 24 columns in order.
+    """
+    import pandas as pd
+    import numpy as np
+
+    if df is None or df.empty:
+        return df
+
+    # Strip leading/trailing spaces from headers
+    df.columns = [str(c).strip() for c in df.columns]
+    col_map_lower = {c.lower(): c for c in df.columns}
+
+    required_features = TARGET_24_COLUMNS[:22]
+
+    # 1. If CSV already matches our schema (has all 22 required feature columns)
+    if all(c.lower() in col_map_lower for c in required_features):
+        rename_map = {col_map_lower[c.lower()]: c for c in required_features}
+        for c in ["label", "attack_stage"]:
+            if c.lower() in col_map_lower:
+                rename_map[col_map_lower[c.lower()]] = c
+
+        adapted = df.rename(columns=rename_map).copy()
+        if "label" not in adapted.columns:
+            adapted["label"] = ""
+        if "attack_stage" not in adapted.columns:
+            adapted["attack_stage"] = ""
+        return adapted[TARGET_24_COLUMNS]
+
+    # 2. Smart mapping for CICFlowMeter or arbitrary flow CSVs
+    out = pd.DataFrame(index=df.index)
+
+    def find_col(*candidates):
+        for cand in candidates:
+            cl = cand.strip().lower()
+            if cl in col_map_lower:
+                return col_map_lower[cl]
+        return None
+
+    unmapped_needed = []
+
+    # IP & Ports
+    src_ip_col = find_col("src_ip", "source ip", "src ip", "source_ip", "srcip", "sourceip")
+    dst_ip_col = find_col("dst_ip", "destination ip", "dst ip", "destination_ip", "dstip", "destinationip")
+    src_port_col = find_col("src_port", "source port", "src port", "source_port", "srcport")
+    dst_port_col = find_col("dst_port", "destination port", "dst port", "destination_port", "dstport")
+
+    out["src_ip"] = df[src_ip_col].astype(str) if src_ip_col else "0.0.0.0"
+    out["dst_ip"] = df[dst_ip_col].astype(str) if dst_ip_col else "0.0.0.0"
+    out["src_port"] = pd.to_numeric(df[src_port_col], errors="coerce").fillna(0).astype(int) if src_port_col else 0
+    out["dst_port"] = pd.to_numeric(df[dst_port_col], errors="coerce").fillna(0).astype(int) if dst_port_col else 0
+
+    # Protocol
+    proto_col = find_col("protocol", "proto")
+    if proto_col:
+        def _norm_p(v):
+            vs = str(v).strip()
+            if vs == "6" or vs.lower() == "tcp":
+                return "TCP"
+            if vs == "17" or vs.lower() == "udp":
+                return "UDP"
+            if vs == "1" or vs.lower() == "icmp":
+                return "ICMP"
+            return vs.upper() if vs else "TCP"
+        out["protocol"] = df[proto_col].apply(_norm_p)
+    else:
+        out["protocol"] = "TCP"
+
+    # Duration: "Flow Duration" / 1e6 (CICFlowMeter is in microseconds)
+    dur_col = find_col("duration", "flow duration", "flow_duration")
+    if dur_col:
+        raw_dur = pd.to_numeric(df[dur_col], errors="coerce").fillna(0.0)
+        out["duration"] = (raw_dur / 1e6) if dur_col.lower() == "flow duration" else raw_dur
+    else:
+        unmapped_needed.append("duration / Flow Duration")
+
+    # Timestamps: flow_start, flow_end
+    start_col = find_col("flow_start", "timestamp", "flow start", "start time")
+    if start_col:
+        out["flow_start"] = df[start_col].astype(str)
+    else:
+        import time
+        now = time.time()
+        out["flow_start"] = [now + i for i in range(len(df))]
+
+    end_col = find_col("flow_end", "flow end", "end time")
+    if end_col:
+        out["flow_end"] = df[end_col].astype(str)
+    else:
+        try:
+            starts = pd.to_numeric(out["flow_start"], errors="coerce").fillna(0.0)
+            out["flow_end"] = (starts + out["duration"]).astype(str)
+        except Exception:
+            out["flow_end"] = out["flow_start"]
+
+    # Packet count: "Total Fwd Packets" + "Total Backward Packets"
+    pkt_col = find_col("packet_count", "total packets", "packet count", "tot pkts")
+    if pkt_col:
+        out["packet_count"] = pd.to_numeric(df[pkt_col], errors="coerce").fillna(0.0)
+    else:
+        fwd_p = find_col("total fwd packets", "total fwd packet", "fwd packets", "tot fwd pkts")
+        bwd_p = find_col("total backward packets", "total bwd packets", "bwd packets", "tot bwd pkts")
+        if fwd_p or bwd_p:
+            fv = pd.to_numeric(df[fwd_p], errors="coerce").fillna(0.0) if fwd_p else 0.0
+            bv = pd.to_numeric(df[bwd_p], errors="coerce").fillna(0.0) if bwd_p else 0.0
+            out["packet_count"] = fv + bv
+        else:
+            unmapped_needed.append("packet_count / Total Fwd Packets")
+
+    # Byte count: "Total Length of Fwd Packets" + "Total Length of Bwd Packets"
+    byte_col = find_col("byte_count", "total bytes", "byte count", "tot bytes")
+    if byte_col:
+        out["byte_count"] = pd.to_numeric(df[byte_col], errors="coerce").fillna(0.0)
+    else:
+        fwd_b = find_col("total length of fwd packets", "total fwd bytes", "tot fwd bytes", "fwd header length")
+        bwd_b = find_col("total length of bwd packets", "total bwd bytes", "tot bwd bytes", "bwd header length")
+        if fwd_b or bwd_b:
+            fv = pd.to_numeric(df[fwd_b], errors="coerce").fillna(0.0) if fwd_b else 0.0
+            bv = pd.to_numeric(df[bwd_b], errors="coerce").fillna(0.0) if bwd_b else 0.0
+            out["byte_count"] = fv + bv
+        else:
+            unmapped_needed.append("byte_count / Total Length of Fwd Packets")
+
+    # Flags
+    syn_col = find_col("syn_count", "syn flag count", "syn_flag_count", "syn flag")
+    ack_col = find_col("ack_count", "ack flag count", "ack_flag_count", "ack flag")
+    fin_col = find_col("fin_count", "fin flag count", "fin_flag_count", "fin flag")
+    rst_col = find_col("rst_count", "rst flag count", "rst_flag_count", "rst flag")
+
+    out["syn_count"] = pd.to_numeric(df[syn_col], errors="coerce").fillna(0.0) if syn_col else 0.0
+    out["ack_count"] = pd.to_numeric(df[ack_col], errors="coerce").fillna(0.0) if ack_col else 0.0
+    out["fin_count"] = pd.to_numeric(df[fin_col], errors="coerce").fillna(0.0) if fin_col else 0.0
+    out["rst_count"] = pd.to_numeric(df[rst_col], errors="coerce").fillna(0.0) if rst_col else 0.0
+
+    # Win mean & win var
+    win_mean_col = find_col("win_mean", "init_win_bytes_forward", "init win bytes forward", "init_win_bytes_backward")
+    if win_mean_col:
+        out["win_mean"] = pd.to_numeric(df[win_mean_col], errors="coerce").fillna(0.0).clip(lower=0)
+    else:
+        out["win_mean"] = 0.0
+
+    win_var_col = find_col("win_var", "win var", "window variance")
+    out["win_var"] = pd.to_numeric(df[win_var_col], errors="coerce").fillna(0.0) if win_var_col else 0.0
+
+    # Payload mean & std
+    pay_mean_col = find_col("payload_mean", "average packet size", "avg packet size", "packet length mean", "fwd packet length mean")
+    out["payload_mean"] = pd.to_numeric(df[pay_mean_col], errors="coerce").fillna(0.0) if pay_mean_col else 0.0
+
+    pay_std_col = find_col("payload_std", "packet length std", "fwd packet length std")
+    out["payload_std"] = pd.to_numeric(df[pay_std_col], errors="coerce").fillna(0.0) if pay_std_col else 0.0
+
+    # TTL Handling (Requirement 4)
+    ttl_mean_col = find_col("ttl_mean", "ttl mean", "average ttl")
+    ttl_var_col = find_col("ttl_var", "ttl var", "ttl variance")
+
+    if ttl_mean_col:
+        out["ttl_mean"] = pd.to_numeric(df[ttl_mean_col], errors="coerce").fillna(64.0)
+        out["ttl_var"] = pd.to_numeric(df[ttl_var_col], errors="coerce").fillna(0.0) if ttl_var_col else 0.0
+    else:
+        out["ttl_mean"] = 64.0
+        out["ttl_var"] = 0.0
+        print("[WARNING] CSV missing 'ttl_mean'. Imputed default TTL=64 (ttl_var=0). Threat detection accuracy on this file may be reduced.", flush=True)
+
+    frag_col = find_col("frag_ratio", "fragment ratio")
+    out["frag_ratio"] = pd.to_numeric(df[frag_col], errors="coerce").fillna(0.0) if frag_col else 0.0
+
+    retx_col = find_col("retransmit_count", "retransmit count")
+    out["retransmit_count"] = pd.to_numeric(df[retx_col], errors="coerce").fillna(0.0) if retx_col else 0.0
+
+    # Label & attack_stage
+    lbl_col = find_col("label", "attack_stage", "attack stage")
+    if lbl_col:
+        out["label"] = df[lbl_col].astype(str).fillna("")
+        out["attack_stage"] = df[lbl_col].astype(str).fillna("")
+    else:
+        out["label"] = ""
+        out["attack_stage"] = ""
+
+    if unmapped_needed:
+        raise ValueError(f"Could not map mandatory flow metrics: {', '.join(unmapped_needed)}")
+
+    for col in TARGET_24_COLUMNS:
+        if col not in out.columns:
+            out[col] = 0.0 if col not in ("src_ip", "dst_ip", "protocol", "flow_start", "flow_end", "label", "attack_stage") else ""
+
+    return out[TARGET_24_COLUMNS]
+
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """
+    POST /api/upload
+    Accepts an offline PCAP (.pcap, .pcapng) or CSV (.csv) file.
+    Validates CSV columns or converts PCAP to flow CSV, runs LSTM model inference per conversation.
+    Returns upload summary and per-conversation forecast results.
+    """
+    start_time = time.time()
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided in request.")
+
+    filename = file.filename
+    ext = os.path.splitext(filename)[1].lower()
+
+    if ext not in (".pcap", ".pcapng", ".csv"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file extension '{ext}'. CyberForecaster only accepts .pcap, .pcapng, and .csv files."
+        )
+
+    content = await file.read()
+    if not content or len(content) == 0:
+        raise HTTPException(status_code=400, detail=f"Uploaded file '{filename}' is empty.")
+    # All heavy work runs in a worker thread, so the server keeps answering other requests meanwhile.
+    return await asyncio.to_thread(_process_upload, content, filename, ext, start_time)
+
+
+# Limits for the conversation list of an upload. The forecast itself comes from the v2 world model (per host,
+# every window of the file); the list below only feeds the conversation picker and its flow table.
+UPLOAD_MAX_CONVERSATIONS = 300        # conversations listed
+UPLOAD_MAX_PER_SOURCE = 12            # conversations listed per source host
+UPLOAD_FLOWS_PER_CONVERSATION = 60    # latest flows kept per conversation (the page shows up to 50)
+UPLOAD_V2_WAIT_S = 900                # how long the upload waits for the world model before answering
+
+
+def _process_upload(content: bytes, filename: str, ext: str, start_time: float) -> dict:
+    """Upload = v2 world model (the forecast) + a conversation list for the picker. If the conversation list cannot
+    be built for this file (a format only the v2 loader understands) the upload still succeeds when v2 does."""
+    import uuid
+    box = {}
+    try:
+        return _process_upload_body(content, filename, ext, start_time, box)
+    except HTTPException as e:
+        th = box.get("v2_thread")
+        if th is None:
+            raise
+        th.join(timeout=UPLOAD_V2_WAIT_S)
+        with _forecast_v2_lock:
+            mine = _latest_forecast_v2.get("file") == filename
+            v2_status = _latest_forecast_v2.get("status") if mine else "running"
+            v2_reason = _latest_forecast_v2.get("reason") if mine else None
+            v2_flows = _latest_forecast_v2.get("flows", 0) if mine else 0
+        if v2_status != "success":
+            if v2_status == "unusable_file" and v2_reason:
+                raise HTTPException(status_code=400, detail=v2_reason)
+            raise
+        response_data = {
+            "status": "no_conversations_qualified",
+            "upload_id": str(uuid.uuid4()),
+            "filename": filename,
+            "total_flows": int(v2_flows or 0),
+            "total_conversations": 0,
+            "conversations_skipped_too_short": 0,
+            "conversations_eligible": 0,
+            "conversations_listed": 0,
+            "world_model_status": v2_status,
+            "note": f"No conversation list for this file ({e.detail}). The per-host forecast is complete.",
+            "results": [],
+            "all_flows": [],
+            "processing_seconds": round(time.time() - start_time, 1),
+        }
+        _save_latest_forecast(response_data)
+        print(f"[UPLOAD] File: {filename} | no conversation list ({e.detail}) | World model: success | "
+              f"Time: {response_data['processing_seconds']}s", flush=True)
+        return response_data
+
+
+def _process_upload_body(content: bytes, filename: str, ext: str, start_time: float, box: dict) -> dict:
+    import tempfile
+    v2_thread = None
+    pcap_csv = None
+
+    REQUIRED_COLUMNS = [
+        "src_ip", "dst_ip", "src_port", "dst_port", "protocol", "flow_start", "flow_end",
+        "duration", "packet_count", "byte_count", "syn_count", "ack_count", "fin_count",
+        "rst_count", "ttl_mean", "ttl_var", "win_mean", "win_var", "frag_ratio",
+        "payload_mean", "payload_std", "retransmit_count"
+    ]
+
+    import pandas as pd
+    import io
+    import uuid
+
+    if ext == ".csv":
+        v2_thread = box["v2_thread"] = _start_forecast_v2(content, filename)   # v2 world model (73 features, per host)
+        try:
+            df = pd.read_csv(io.BytesIO(content), low_memory=False)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not parse CSV file ({filename}): {str(e)}")
+
+        if df.empty:
+            raise HTTPException(status_code=400, detail=f"CSV file ({filename}) is empty.")
+
+        try:
+            df = _adapt_arbitrary_csv_to_schema(df)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"CSV schema adaptation failed for ({filename}): {str(e)}"
+            )
+
+        col_map = {c.strip().lower(): c for c in df.columns}
+        missing = [col for col in REQUIRED_COLUMNS if col not in col_map]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing required columns: {missing}"
+            )
+
+        df = df.rename(columns={col_map[col]: col for col in REQUIRED_COLUMNS if col in col_map})
+
+    else:
+        # The capture is turned into flows ONCE; the same flow table then feeds the v2 world model.
+        with tempfile.NamedTemporaryFile(suffix=".flows.csv", delete=False) as _t:
+            pcap_csv = _t.name
+        try:
+            df = _pcap_bytes_to_flow_df(content, keep_csv=pcap_csv)
+        except Exception as e:
+            box["v2_thread"] = _start_forecast_v2(content, filename, cleanup=pcap_csv)   # v2 reports its own reason
+            raise HTTPException(
+                status_code=400,
+                detail=f"Error parsing PCAP file ({filename}): {str(e)}"
+            )
+        v2_thread = box["v2_thread"] = _start_forecast_v2(content, filename, pcap_flows_csv=pcap_csv, cleanup=pcap_csv)
+
+    numeric_cols = [c for c in REQUIRED_COLUMNS if c not in ("src_ip", "dst_ip", "protocol")]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    import numpy as np
+    df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    # Text columns (e.g. empty label / attack_stage in live captures) can be NaN.
+    # NaN is not valid JSON, so the response would crash with a 500 and the
+    # browser shows "Failed to fetch". Replace missing text values with "".
+    text_cols = [c for c in df.columns if c not in numeric_cols]
+    for c in text_cols:
+        df[c] = df[c].astype(object).where(df[c].notna(), "")
+
+    df["src_ip"] = df["src_ip"].astype(str)
+    df["dst_ip"] = df["dst_ip"].astype(str)
+    df["protocol"] = df["protocol"].astype(str)
+
+    seq_len = 5            # a conversation is listed when it has at least 5 flows
+
+    total_flows = len(df)
+    conversation_groups = df.groupby(["src_ip", "dst_ip"], sort=False)
+    sizes = conversation_groups.size()
+    total_conversations = int(len(sizes))
+    skipped_too_short = int((sizes < seq_len).sum())
+    eligible = sizes[sizes >= seq_len].sort_values(ascending=False, kind="stable")
+
+    # Wait for the v2 world model, then list first the conversations of the hosts it ranked highest.
+    v2_status, v2_hosts, v2_chart_hosts = "not_started", [], {}
+    if v2_thread is not None:
+        v2_thread.join(timeout=UPLOAD_V2_WAIT_S)
+        with _forecast_v2_lock:
+            if _latest_forecast_v2.get("file") == filename:
+                v2_status = _latest_forecast_v2.get("status", "running")
+                if v2_status == "success":
+                    v2_hosts = list((_latest_forecast_v2.get("chart") or {}).get("host_order") or [])
+                    v2_chart_hosts = (_latest_forecast_v2.get("chart") or {}).get("hosts") or {}
+    rank = {h: i for i, h in enumerate(v2_hosts)}
+    if v2_chart_hosts:
+        # The forecast is made per SOURCE host, and the result holds the hosts with the highest risk. Only the
+        # conversations of those hosts are listed, so every entry of the picker shows its own host's forecast
+        # (never another host's numbers). Every such host is listed, also with fewer than 5 flows.
+        with_forecast = sizes[[k[0] in v2_chart_hosts for k in sizes.index]].sort_values(ascending=False, kind="stable")
+        keys = sorted(with_forecast.index, key=lambda k: rank.get(k[0], len(rank)))   # stable: busiest first per host
+    else:
+        keys = sorted(eligible.index, key=lambda k: rank.get(k[0], len(rank)))     # stable: busiest first within a rank
+    selected, per_src = [], {}
+    for k in keys:
+        if per_src.get(k[0], 0) >= UPLOAD_MAX_PER_SOURCE:
+            continue
+        per_src[k[0]] = per_src.get(k[0], 0) + 1
+        selected.append(k)
+        if len(selected) >= UPLOAD_MAX_CONVERSATIONS:
+            break
+
+    results = []
+    group_rows = conversation_groups.indices
+    for (src_ip, dst_ip) in selected:
+        group_sorted = df.iloc[group_rows[(src_ip, dst_ip)]].sort_values("flow_start", kind="stable")
+        n_flows = len(group_sorted)
+        flows = group_sorted.tail(max(UPLOAD_FLOWS_PER_CONVERSATION, seq_len)).to_dict(orient="records")
+
+        # Every value below comes from the trained world model (73 features, per source host).
+        # The old 15-feature model is no longer used for uploads.
+        H = v2_chart_hosts.get(src_ip) or {}
+        risk_series = H.get("risk_60s") or []
+        risk = stage = None
+        forecast_tl = []
+        if risk_series:
+            risk = float(risk_series[-1])
+            alerting = bool((H.get("alert") or [False])[-1])
+            stage = ((H.get("likely_attack_stage") or [None])[-1] if alerting
+                     else (H.get("stage_now") or [None])[-1])
+            curve = (H.get("forecast_curve") or [[]])[-1] or []
+            steps = (H.get("stage_forecast") or [[]])[-1] or []
+            forecast_tl = [{"step": k + 1, "seconds_ahead": 10 * (k + 1), "risk": curve[k],
+                            "stage": steps[k + 1] if k + 1 < len(steps) else None} for k in range(len(curve))]
+
+        results.append({
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "model": "world model (forecast for the source host)" if risk_series else None,
+            "infiltration_probability": risk,
+            "predicted_stage": stage,
+            "stage_probabilities": {},
+            "forecast_timeline": forecast_tl,
+            "flows_used": n_flows,
+            "windows_analyzed": len(risk_series),
+            "window_timeline": [],
+            "flows": flows,
+        })
+
+    # Keep the world model's host order (most at-risk host first), busiest conversation first within a host.
+    order = {k: i for i, k in enumerate(selected)}
+    results.sort(key=lambda c: (rank.get(c["src_ip"], len(rank)), order[(c["src_ip"], c["dst_ip"])]))
+
+    response_data = {
+        "status": "success" if results else "no_conversations_qualified",
+        "upload_id": str(uuid.uuid4()),
+        "filename": filename,
+        "total_flows": total_flows,
+        "total_conversations": total_conversations,
+        "conversations_skipped_too_short": skipped_too_short,
+        "conversations_eligible": int(len(eligible)),
+        "conversations_of_hosts_with_forecast": bool(v2_chart_hosts),
+        "conversations_listed": len(results),
+        "world_model_status": v2_status,
+        "sequence_length": seq_len,
+        "forecast_horizon": 6,
+        "results": results,
+        "all_flows": df[["src_ip", "dst_ip", "packet_count", "byte_count", "protocol"]].head(2500).to_dict(orient="records") if "src_ip" in df.columns and "dst_ip" in df.columns else [],
+    }
+
+    _save_latest_forecast(response_data)
+    elapsed = time.time() - start_time
+    response_data["processing_seconds"] = round(elapsed, 1)
+    print(f"[UPLOAD] File: {filename} | Rows: {total_flows} | Conversations: {total_conversations} | Listed: {len(results)} | World model: {v2_status} | Time: {elapsed:.3f}s", flush=True)
+
+    if not results and v2_status != "success":
+        raise HTTPException(
+            status_code=400,
+            detail=f"File processed: {total_flows} flows, {total_conversations} conversations, 0 had enough flows (need >= 5 per src/dst pair)"
+        )
+
+    return response_data
+
+
+# ── v2 world model: 73 window features per host, universal loader (world_model.py) ──────────────────
+_latest_forecast_v2 = {"status": "no_upload"}
+_forecast_v2_lock = threading.Lock()
+_LATEST_FORECAST_V2_FILE = os.path.join(_LIVE_DATA_DIR, 'latest_forecast_v2.json')
+
+
+def _save_latest_forecast_v2(data: dict):
+    """Keep the last finished v2 result on disk so it survives a server restart (like the v1 result)."""
+    try:
+        if data.get("status") in ("success", "unusable_file", "error"):
+            os.makedirs(_LIVE_DATA_DIR, exist_ok=True)
+            with open(_LATEST_FORECAST_V2_FILE, 'w') as f:
+                json.dump(data, f)
+    except Exception as e:
+        print(f"[Latest Forecast v2 Save Error]: {e}", flush=True)
+
+
+def _run_forecast_v2(content: bytes, filename: str, pcap_flows_csv: str = None) -> dict:
+    """Run the v2 pipeline on uploaded bytes. Never raises: problems are returned as a status + reason."""
+    import tempfile
+    tmp_path = None
+    t_start = time.time()
+    try:
+        import world_model
+        suffix = os.path.splitext(filename or "upload")[1] or ".bin"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        try:
+            res = world_model.analyze(tmp_path, pcap_flows_csv=pcap_flows_csv)
+        except world_model.UnusableFile as e:
+            return {"status": "unusable_file", "file": filename, "reason": str(e)}
+        res["status"], res["file"] = "success", filename
+        res["processing_seconds"] = round(time.time() - t_start, 1)
+        return res
+    except Exception as e:
+        return {"status": "error", "file": filename, "reason": repr(e)}
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _start_forecast_v2(content: bytes, filename: str, pcap_flows_csv: str = None, cleanup: str = None):
+    """Start the v2 world model in the background and return its thread. `pcap_flows_csv` is the flow table the
+    upload already extracted from a capture; `cleanup` is a temporary file to delete when the run ends."""
+    global _latest_forecast_v2
+    with _forecast_v2_lock:
+        _latest_forecast_v2 = {"status": "running", "file": filename}
+
+    def work():
+        global _latest_forecast_v2
+        try:
+            res = _run_forecast_v2(content, filename, pcap_flows_csv=pcap_flows_csv)
+        finally:
+            if cleanup and os.path.exists(cleanup):
+                try:
+                    os.remove(cleanup)
+                except Exception:
+                    pass
+        with _forecast_v2_lock:
+            if _latest_forecast_v2.get("file") == filename:      # ignore results of an older upload
+                _latest_forecast_v2 = res
+                _save_latest_forecast_v2(res)
+        print(f"[UPLOAD v2] {filename}: {res.get('status')} {res.get('reason', '')} "
+              f"({res.get('processing_seconds', '?')} s)", flush=True)
+
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    return th
+
+
+@app.post("/api/v2/upload")
+async def upload_file_v2(file: UploadFile = File(...)):
+    """Any PCAP / PCAPNG / flow CSV (also .gz .bz2 .zip) -> per-host forecast from the v2 world model."""
+    global _latest_forecast_v2
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided in request.")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail=f"Uploaded file '{file.filename}' is empty.")
+    res = await asyncio.to_thread(_run_forecast_v2, content, file.filename)
+    with _forecast_v2_lock:
+        _latest_forecast_v2 = res
+        _save_latest_forecast_v2(res)
+    if res["status"] != "success":
+        raise HTTPException(status_code=400 if res["status"] == "unusable_file" else 500, detail=res.get("reason", "v2 forecast failed"))
+    return res
+
+
+@app.get("/api/v2/forecast/latest")
+def get_latest_forecast_v2():
+    """Latest v2 result: {"status": "no_upload" | "running" | "success" | "unusable_file" | "error", ...}."""
+    global _latest_forecast_v2
+    with _forecast_v2_lock:
+        return _latest_forecast_v2
+
+
+@app.get("/api/forecast/latest")
+def get_latest_forecast():
+    """Returns the result of the most recent upload, or {"status": "no_upload"} if nothing was uploaded."""
+    return _get_latest_forecast()
+
+
+@app.post("/api/forecast/reset")
+def reset_forecast():
+    """Resets the forecast state to no_upload and clears saved forecast files."""
+    global _latest_forecast_result, _latest_forecast_v2
+    with _forecast_v2_lock:
+        _latest_forecast_result = {"status": "no_upload"}
+        _latest_forecast_v2 = {"status": "no_upload"}
+        for fpath in (_LATEST_FORECAST_FILE, _LATEST_FORECAST_V2_FILE):
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
+    return {"status": "reset", "message": "Forecast state reset to no_upload"}
+
+
+@app.get("/api/capture/summary")
+def get_capture_summary():
+    """Return current packet capture summary computed with the training extractor."""
+    with _raw_packet_lock:
+        pkts = list(_raw_packet_buffer)
+
+    packet_count = len(pkts)
+    if not pkts:
+        return {
+            "packets_captured": 0,
+            "flows_extracted": 0,
+            "forecastable_conversations": 0
+        }
+
+    import tempfile
+    from scapy.utils import wrpcap
+    from scapy.layers.inet import Ether, IP
+
+    normalized_pkts = []
+    for p in pkts:
+        try:
+            if isinstance(p, bytes):
+                if len(p) >= 20 and (p[0] & 0xf0) == 0x40:
+                    p = IP(p)
+                else:
+                    p = Ether(p)
+            if not getattr(p, "haslayer", None):
+                continue
+            if not p.haslayer(Ether):
+                p_norm = Ether(dst="ff:ff:ff:ff:ff:ff", src="00:00:00:00:00:00") / p
+                if hasattr(p, "time"):
+                    p_norm.time = p.time
+                normalized_pkts.append(p_norm)
+            else:
+                normalized_pkts.append(p)
+        except Exception:
+            pass
+
+    if not normalized_pkts:
+        return {
+            "packets_captured": packet_count,
+            "flows_extracted": 0,
+            "forecastable_conversations": 0
+        }
+
+    tmp_pcap_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pcap", delete=False) as tmp:
+            tmp_pcap_path = tmp.name
+        wrpcap(tmp_pcap_path, normalized_pkts)
+
+        df = _run_extractor_on_pcap(tmp_pcap_path, known_clean=False)
+        flows_extracted = len(df)
+        if not df.empty:
+            conv_counts = df.groupby(["src_ip", "dst_ip"]).size()
+            forecastable = int((conv_counts >= 5).sum())
+        else:
+            forecastable = 0
+
+        return {
+            "packets_captured": packet_count,
+            "flows_extracted": flows_extracted,
+            "forecastable_conversations": forecastable
+        }
+    except Exception as e:
+        print(f"[Capture Summary Error] {e}", flush=True)
+        return {
+            "packets_captured": packet_count,
+            "flows_extracted": 0,
+            "forecastable_conversations": 0
+        }
+    finally:
+        if tmp_pcap_path and os.path.exists(tmp_pcap_path):
+            try:
+                os.remove(tmp_pcap_path)
+            except Exception:
+                pass
+
+
+@app.get("/api/capture/download")
+def download_capture(format: str = "pcap", known_clean: int = 0):
+    """Download current/latest capture files as PCAP or CSV using the training extractor."""
+    from starlette.responses import Response
+    import tempfile
+    from scapy.utils import wrpcap
+    from scapy.layers.inet import Ether, IP
+
+    with _raw_packet_lock:
+        pkts = list(_raw_packet_buffer)
+    if not pkts:
+        raise HTTPException(status_code=404, detail="No capture data available for download.")
+
+    normalized_pkts = []
+    for p in pkts:
+        try:
+            if isinstance(p, bytes):
+                if len(p) >= 20 and (p[0] & 0xf0) == 0x40:
+                    p = IP(p)
+                else:
+                    p = Ether(p)
+            if not getattr(p, "haslayer", None):
+                continue
+            if not p.haslayer(Ether):
+                p_norm = Ether(dst="ff:ff:ff:ff:ff:ff", src="00:00:00:00:00:00") / p
+                if hasattr(p, "time"):
+                    p_norm.time = p.time
+                normalized_pkts.append(p_norm)
+            else:
+                normalized_pkts.append(p)
+        except Exception as _pe:
+            print(f"[Download Normalization Warning] {_pe}", flush=True)
+
+    if not normalized_pkts:
+        raise HTTPException(status_code=404, detail="No valid packet data available for download.")
+
+    now = datetime.now()
+    ts_str = now.strftime("%Y%m%d_%H%M%S")
+
+    tmp_pcap_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pcap", delete=False) as tmp:
+            tmp_pcap_path = tmp.name
+
+        wrpcap(tmp_pcap_path, normalized_pkts)
+
+        if format == "csv":
+            df = _run_extractor_on_pcap(tmp_pcap_path, known_clean=bool(known_clean))
+            csv_str = df.to_csv(index=False)
+            filename = f"live_capture_{ts_str}.csv"
+            return Response(
+                content=csv_str.encode("utf-8"),
+                media_type="text/csv",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Access-Control-Expose-Headers": "Content-Disposition",
+                }
+            )
+        else:
+            with open(tmp_pcap_path, "rb") as f:
+                pcap_bytes = f.read()
+            filename = f"live_capture_{ts_str}.pcap"
+            return Response(
+                content=pcap_bytes,
+                media_type="application/vnd.tcpdump.pcap",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Access-Control-Expose-Headers": "Content-Disposition",
+                }
+            )
+    finally:
+        if tmp_pcap_path and os.path.exists(tmp_pcap_path):
+            try:
+                os.remove(tmp_pcap_path)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    _port = int(os.environ.get("CAPTURE_PORT", 8080))
+    _host = os.environ.get("CAPTURE_HOST", "0.0.0.0")
+    print("=" * 60)
+    print("  CyberForecaster Capture Server")
+    print("  Real-time packet capture via Scapy + Npcap")
+    print(f"  Listening on {_host}:{_port}")
+    print(f"  (Override with CAPTURE_HOST / CAPTURE_PORT env vars)")
+    print("=" * 60)
+    _build_scapy_map()
+    print(f"  Scapy device map: {len(iface_to_scapy)} Npcap devices found")
+    interfaces = get_real_interfaces()
+    print(f"  Detected {len(interfaces)} network interfaces:")
+    for iface in interfaces:
+        status = "*" if iface["is_up"] else "-"
+        scapy_dev = _resolve_scapy_iface(iface["name"])
+        mapped = " [mapped]" if scapy_dev != iface["name"] else ""
+        print(f"    {status} {iface['name']} ({iface['type']}) - {iface['ip']}{mapped}")
+    print("=" * 60)
+    print("  Live pipeline: REAL observed IPs only — demo hosts (192.168.1.10/.15/.20/.45/.50)")
+    print("  are never used as fallbacks for live traffic.")
+    print("=" * 60)
+    uvicorn.run(app, host=_host, port=_port)

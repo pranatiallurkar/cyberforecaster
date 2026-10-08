@@ -1,0 +1,206 @@
+/* Fonts are bundled locally (@fontsource), imported in main.jsx: no internet needed. */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  font-size: 16px;
+  background-color: #111110;
+  color: #f4f3ee;
+}
+
+:root {
+  --bg:        #111110;
+  --surface:   #1a1a19;
+  --surface-2: #262624;
+  --border:    #2e2e2b;
+  --blue:      #22386E;
+  --blue-hi:   #3987e5;
+  --gold:      #CBA135;
+  --gold-hi:   #E0C36A;
+  --text:      #f4f3ee;
+  --text-secondary: #c3c2b7;
+  --text-muted:#8f8e86;
+  --white:     #FFFFFF;
+  font-family: 'Inter', "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+  background-color: var(--bg);
+  color: var(--text);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #262E3A #0B0F14;
+}
+
+body {
+  margin: 0;
+  color: #f4f3ee;
+  background-color: #111110;
+  overflow-x: hidden;
+  font-size: 1rem;
+  line-height: 1.5;
+  font-family: 'Inter', "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: 'Inter', "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+  letter-spacing: -0.015em;
+}
+
+/* UI text font overrides to replace tech-mono with clean Inter */
+.font-mono-tech {
+  font-family: 'Inter', "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+}
+
+.font-mono-jb {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Subtle background grid */
+.cyber-grid {
+  background-size: 40px 40px;
+  background-image:
+    linear-gradient(to right, rgba(38, 46, 58, 0.4) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(38, 46, 58, 0.4) 1px, transparent 1px);
+}
+
+/* Light blue subtle background squared grid with white-tinted grid lines */
+.cyber-grid-blue {
+  background-color: #0b1322;
+  background-size: 36px 36px;
+  background-image:
+    linear-gradient(to right, rgba(220, 235, 255, 0.08) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(220, 235, 255, 0.08) 1px, transparent 1px);
+}
+
+/* Clean panel / card */
+.glass-card {
+  background: #141A22;
+  border: 1px solid #262E3A;
+  border-radius: 0.75rem;
+}
+
+.glass-card-hover:hover {
+  border-color: #CBA135;
+}
+
+/* Stage badges */
+.badge-stage {
+  @apply px-2.5 py-1 rounded text-xs font-bold uppercase tracking-wider bg-[#CBA135] text-[#0B0F14];
+}
+
+/* Sidebar nav item */
+.nav-item {
+  @apply flex items-center gap-3 px-3 py-2.5 rounded-lg text-base transition-all duration-200 cursor-pointer text-[#9BA6B4];
+}
+
+.nav-item:hover {
+  background: #1B2430;
+  color: #FFFFFF;
+}
+
+.nav-item.active {
+  background: #CBA135;
+  color: #0B0F14;
+  font-weight: 700;
+}
+
+/* Scrollbar for webkit */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0B0F14;
+}
+::-webkit-scrollbar-thumb {
+  background: #262E3A;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #CBA135;
+}
+
+/* KPI card */
+.kpi-card {
+  @apply glass-card rounded-xl p-4 flex items-center justify-between bg-[#141A22] border border-[#262E3A];
+}
+
+/* Status dot */
+.status-dot {
+  @apply h-2.5 w-2.5 rounded-full inline-block;
+}
+
+.status-dot-online { @apply bg-[#CBA135]; }
+.status-dot-warning { @apply bg-[#E0C36A]; }
+.status-dot-danger { @apply bg-[#CBA135]; }
+
+/* Chart tooltip override */
+.recharts-tooltip-wrapper {
+  outline: none !important;
+}
+
+/* Mitre tag */
+.mitre-tag {
+  @apply text-xs bg-[#1B2430] text-[#F3F1EA] px-2 py-0.5 rounded border border-[#262E3A] inline-flex items-center;
+}
+
+/* Feature bar */
+.feature-bar {
+  @apply h-2 rounded-full transition-all duration-700 ease-out bg-[#CBA135];
+}
+
+/* Tab button */
+.tab-btn {
+  @apply px-3.5 py-2 text-xs uppercase tracking-wider rounded transition-all duration-200 font-bold;
+}
+
+.tab-btn.active {
+  @apply bg-[#CBA135] text-[#0B0F14] border border-[#CBA135];
+}
+
+.tab-btn:not(.active) {
+  @apply text-[#9BA6B4] hover:text-[#FFFFFF] bg-[#141A22] border border-[#262E3A];
+}
+
+/* Table styling overrides */
+table {
+  background-color: #141A22 !important;
+  color: #F3F1EA !important;
+  border-color: #262E3A !important;
+}
+
+table th {
+  background-color: #1B2430 !important;
+  color: #FFFFFF !important;
+  font-weight: 700 !important;
+  border-bottom: 1px solid #262E3A !important;
+}
+
+table td {
+  border-bottom: 1px solid #262E3A !important;
+  color: #F3F1EA !important;
+}
+
+table tr:hover {
+  background-color: #1B2430 !important;
+}
+
+/* Recharts overrides */
+.recharts-default-tooltip {
+  background-color: #1B2430 !important;
+  border: 1px solid #262E3A !important;
+  color: #F3F1EA !important;
+  border-radius: 8px !important;
+}
+
+.recharts-text,
+.recharts-cartesian-axis-tick-value {
+  fill: #9BA6B4 !important;
+}
+
+.recharts-cartesian-grid-horizontal line,
+.recharts-cartesian-grid-vertical line {
+  stroke: #262E3A !important;
+}

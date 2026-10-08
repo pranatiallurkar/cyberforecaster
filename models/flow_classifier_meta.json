@@ -1,0 +1,43 @@
+{
+  "version": "v1",
+  "created": "2026-09-08T14:04:57.103500",
+  "features": [
+    "duration",
+    "packet_count",
+    "byte_count",
+    "src_port",
+    "dst_port",
+    "packets_per_second",
+    "bytes_per_packet",
+    "syn_flag",
+    "ack_flag",
+    "rst_flag",
+    "fin_flag",
+    "protocol_tcp",
+    "protocol_udp",
+    "protocol_other"
+  ],
+  "num_classes": 5,
+  "classes": [
+    "benign",
+    "brute_force",
+    "dos_ddos",
+    "exfiltration",
+    "port_scan"
+  ],
+  "model_type": "XGBClassifier",
+  "xgb_params": {
+    "max_depth": 8,
+    "learning_rate": 0.05,
+    "n_estimators": 500,
+    "min_child_weight": 5,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "reg_alpha": 0.5,
+    "reg_lambda": 2.0,
+    "gamma": 0.2
+  },
+  "training_samples": 350197,
+  "test_accuracy": 0.9882133333333334,
+  "dataset_source": "CIC-IDS2017_full_2.8M_subsampled_500K"
+}

@@ -1,0 +1,75 @@
+# ── Node.js dependencies & build ──────────────────────────────
+**/node_modules/
+/client/dist/
+/client/dist-ssr/
+/client/*.local
+**/.vite/
+**/build/
+
+# ── Python virtual environments & cache ───────────────────────
+/.venv/
+/.agents/
+/**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+
+# ── Large datasets & archives (kept locally, not pushed) ──────
+*.csv
+!sample_test_flows.csv
+!samples/*.csv
+!samples/test_files/*.csv
+*.zip
+*.tar.gz
+*.rar
+*.pcap
+*.pcapng
+!samples/*.pcap
+*.dump
+*.dump.gz
+
+# ── Old / backup model + code artifacts (dead weight) ─────────
+scratch/
+*.bak
+*.bak_*
+*_OLD.pth
+*_OLD*.pth
+*_OLD.json
+*_OLD*.json
+*_backup.json
+*_PERCONV_backup.json
+
+# ── Debug symbols & binaries ──────────────────────────────────
+*.pdb
+*.mdmp
+
+# ── Runtime logs & generated state ────────────────────────────
+/logs/
+/.pytest_cache/
+*.log
+*.err
+
+# ── Environment variables & secrets ───────────────────────────
+.env
+.env.*
+.env.local
+!.env.example
+
+# ── OS files ──────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# -- Generated output and local-only folders --------------------------------------
+/forecast_out/
+/legacy/outputs/
+/legacy/_duplicates_not_in_git/
+/training/world_model/checks/audit/
